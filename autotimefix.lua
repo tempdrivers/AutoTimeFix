@@ -1,10 +1,10 @@
 local CFG = {
     watchdog      = true,   -- keep re-cleaning while the game is open
-    interval      = 1.0,    -- seconds between watchdog passes
+    interval      = 0.5,    -- seconds between watchdog passes
     verbose       = true,   -- print what it does
-    resetTops     = true,   -- force learned Tops to 0
-    resetContest  = true,   -- force contest steps to 0
-    wipeLearned   = true,   -- wipe ALL learned data (climbs/leads/seen) every save
+    resetTops     = false,  -- keep small learned tops (bounded by topBand)
+    resetContest  = false,  -- keep small contest steps (bounded by contestBand)
+    wipeLearned   = false,  -- keep per-animation learning, just capped
     cleanNow      = true,   -- clean the files immediately
     useJobId      = true,   -- only clear clockOffset for a DIFFERENT server
     onScreen      = true,   -- show notifications on the Roblox screen
@@ -12,13 +12,17 @@ local CFG = {
     duration      = 8,      -- seconds before a notification fades
     maxMessages   = 6,      -- max notifications on screen at once
     showPaths     = true,   -- show which files were found + their values
-    leadBand      = 0.06,   -- leads outside +/-this snap to 0 (drift guard)
-    clockBand     = 0.5,    -- clockOffset outside +/-this snaps to 0
-    climbBand     = 0.05,   -- climbs outside +/-this snap to 0 (when wipe is off)
+    leadBand      = 0.04,   -- leads outside +/-this snap to 0
+    clockBand     = 30,     -- clockOffset outside +/-this snaps to 0 (garbage guard)
+    climbBand     = 0.05,   -- per-shot learning cap. raise if stuck at the cap
+    topBand       = 0.05,   -- tops cap
+    contestBand   = 0.5,    -- contest step cap
     leadOverride  = nil,    -- force leads hard. nil = auto band check
     clockOverride = nil,    -- force clockOffset hard. nil = auto band check
     topOverride   = nil,    -- force every tops entry hard. nil = 0
     extraPaths    = {},     -- extra file/folder paths for mobile, e.g. {"/sdcard/..."}
+    selfTest      = true,   -- verify the write hook actually intercepts writes
+    sniff         = true,   -- find files by their content, not just the filename
 }
 
 
@@ -36,12 +40,23 @@ local function getfn(n)
     return type(f) == "function" and f or nil
 end
 
-local readfile  = getfn("readfile")
-local writefile = getfn("writefile")
-local isfile    = getfn("isfile")
-local listfiles = getfn("listfiles")
+-- executors name these differently; try every common spelling
+local function resolve(...)
+    for i = 1, select("#", ...) do
+        local n = select(i, ...)
+        local f = getfn(n)
+        if f then return f, n end
+    end
+    return nil, nil
+end
+
+local readfile,  readName  = resolve("readfile", "read_file", "readFile")
+local writefile, writeName = resolve("writefile", "write_file", "writeFile")
+local isfile,    isfName   = resolve("isfile", "is_file", "file_exists")
+local listfiles, listName  = resolve("listfiles", "list_files", "listFiles")
+local delfile              = resolve("delfile", "delete_file", "remove_file")
 local HS        = game:GetService("HttpService")
-local rawIO: {[string]: any} = {}
+local rawIO: {[string]: any} = { readfile = readfile, writefile = writefile }
 
 --=====================================================================
 -- on-screen notifications (no console spam)
@@ -195,13 +210,22 @@ local function base(p)
     return (p:match("([^/]+)$") or p):lower()
 end
 local function isAuto(n)
-    return not n:find("backup", 1, true)
-        and (n == "autotime.json" or n:match("^autotime.%.json$") ~= nil
-        or n:match("^auto_time.*%.json$") ~= nil)
+    return not n:find("backup", 1, true) and not n:find("probe", 1, true)
+        and (n:match("^autotime.*%.json$") ~= nil
+        or n:match("^auto_time.*%.json$") ~= nil
+        or n:match("^auto time.*%.json$") ~= nil)
 end
 local function isContest(n)
-    return not n:find("backup", 1, true)
+    return not n:find("backup", 1, true) and not n:find("probe", 1, true)
         and (n == "contest.json" or n:match("^contest.*%.json$") ~= nil)
+end
+local function looksAuto(t)
+    return type(t) == "table" and (type(t.tops) == "table"
+        or type(t.climbs) == "table" or t.clockOffset ~= nil)
+end
+local function looksContest(t)
+    return type(t) == "table" and type(t.steps) == "table"
+        and type(t.seen) == "table"
 end
 local function num(v)
     return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
@@ -226,10 +250,13 @@ local function cleanAuto(t, runtime)
     local changed = false
 
     if type(t.tops) ~= "table" then t.tops = {}; changed = true end
+    local tb = CFG.topBand or 0.05
     for k, v in pairs(t.tops) do
         local nv
         if CFG.topOverride ~= nil then nv = CFG.topOverride
-        else nv = CFG.resetTops and 0 or clamp(v, -0.5, 0.5) end
+        elseif CFG.resetTops then nv = 0
+        elseif num(v) and v >= -tb and v <= tb then nv = v
+        else nv = 0 end
         if v ~= nv then t.tops[k] = nv; changed = true end
     end
 
@@ -312,8 +339,12 @@ local function cleanContest(t)
         return nil, false
     end
     local changed = false
+    local cb = CFG.contestBand or 0.5
     for k, v in pairs(t.steps) do
-        local nv = CFG.resetContest and 0 or clamp(v, -50, 50)
+        local nv
+        if CFG.resetContest then nv = 0
+        elseif num(v) and v >= -cb and v <= cb then nv = v
+        else nv = 0 end
         if v ~= nv then t.steps[k] = nv; changed = true end
     end
     for k, v in pairs(t.seen) do
@@ -327,9 +358,13 @@ local function cleanData(path, data, runtime)
     if type(data) ~= "string" or #data == 0 then return nil end
     local n = base(path)
     local auto, contest = isAuto(n), isContest(n)
-    if not auto and not contest then return nil end
     local t = dec(data)
     if not t then return nil end
+    if not auto and not contest then
+        if not CFG.sniff then return nil end
+        auto, contest = looksAuto(t), looksContest(t)
+        if not auto and not contest then return nil end
+    end
     local changed
     if auto then _, changed = cleanAuto(t, runtime)
     else _, changed = cleanContest(t) end
@@ -378,19 +413,26 @@ local function discover()
     for _, p in ipairs(hints) do add(p) end
 
     local roots = { "", ".", "workspace", "/sdcard", "/storage/emulated/0",
-                    "/data/local/tmp", "/storage/emulated/0/Android/data" }
+                    "/data/local/tmp", "/storage/emulated/0/Android/data",
+                    "/sdcard/Delta", "/sdcard/Fluxus", "/sdcard/Codex",
+                    "/sdcard/Arceus X", "/sdcard/Trigon", "/sdcard/Hydrogen",
+                    "/storage/emulated/0/Delta", "/storage/emulated/0/Fluxus",
+                    "/storage/emulated/0/Codex", "/storage/emulated/0/Arceus X",
+                    "/storage/emulated/0/Documents", "/storage/emulated/0/Download" }
     if type(CFG.extraPaths) == "table" then
         for _, p in ipairs(CFG.extraPaths) do
             if type(p) == "string" and p ~= "" then
                 local n = base(p)
-                if isAuto(n) or isContest(n) then add(p) else roots[#roots + 1] = p end
+                if n:find("%.json$") or isAuto(n) or isContest(n) then add(p)
+                else roots[#roots + 1] = p end
             end
         end
     end
 
+    local cands = {}
     if listfiles then
         local q, vis, depth = roots, {}, 0
-        while #q > 0 and depth < 4 do
+        while #q > 0 and depth < 5 do
             local nq = {}
             for _, d in ipairs(q) do
                 if not vis[d] then
@@ -400,7 +442,11 @@ local function discover()
                         for _, e in ipairs(es) do
                             add(e)
                             local n = base(e)
-                            if n ~= "" and not n:find("%.") then nq[#nq + 1] = e end
+                            if n:find("%.json$") then
+                                if #cands < 80 then cands[#cands + 1] = e end
+                            elseif n ~= "" and not n:find("%.") then
+                                nq[#nq + 1] = e
+                            end
                         end
                     end
                 end
@@ -408,11 +454,28 @@ local function discover()
             q, depth = nq, depth + 1
         end
     end
+
+    -- filename didn't match? identify it by content instead
+    if CFG.sniff and readfile then
+        local rf = rawIO.readfile or readfile
+        for _, p in ipairs(cands) do
+            local key = tostring(p):gsub("\\", "/")
+            if not found[key] and not key:find("backup", 1, true)
+                and not key:find("probe", 1, true) then
+                local ok, data = pcall(rf, p)
+                local t = ok and dec(data) or nil
+                if t and (looksAuto(t) or looksContest(t)) then
+                    found[key] = true
+                end
+            end
+        end
+    end
     return found
 end
 
 
 local warned = {}
+local verified = {}
 local function cleanFile(path, runtime)
     local rf = rawIO.readfile or readfile
     local wf = rawIO.writefile or writefile
@@ -432,11 +495,18 @@ local function cleanFile(path, runtime)
     end
     warned[path] = nil
     log("cleaned " .. path)
+    if not verified[path] then
+        verified[path] = true
+        local vok, vdata = pcall(rf, path)
+        if vok and type(vdata) == "string" and vdata ~= out then
+            warnLog("save did not stick: " .. base(path))
+        end
+    end
     return true
 end
 
 
-local function installHook(name, factory)
+local function installHook(name, key, factory)
     local orig = getfn(name)
     if not orig then return false end
     local callOrig, active = orig, {}
@@ -451,14 +521,15 @@ local function installHook(name, factory)
     end
     local wrapper = factory(call)
 
-    for _, hn in ipairs({ "hookfunction", "replaceclosure" }) do
+    for _, hn in ipairs({ "hookfunction", "replaceclosure", "hookfunc",
+                          "detourfunction", "replace_closure", "hook" }) do
         local hf = getfn(hn)
         if hf then
             local ok, ret = pcall(hf, orig, wrapper)
             if ok and type(ret) == "function" then
                 callOrig = ret
-                rawIO[name] = ret
-                log(name .. " hooked via " .. hn)
+                rawIO[key] = ret
+                log(key .. " hooked via " .. hn)
                 return true
             end
         end
@@ -470,8 +541,8 @@ local function installHook(name, factory)
         return ok and rawget(tbl, name) == wrapper
     end
     if assign(genv) or assign(_G) then
-        rawIO[name] = wrapper
-        log(name .. " wrapped")
+        rawIO[key] = wrapper
+        log(key .. " wrapped (no hookfunction)")
         return true
     end
     log("could not hook " .. name)
@@ -497,10 +568,9 @@ local function reportValues()
     local rf = rawIO.readfile or readfile
     if not rf then return end
     for p in pairs(paths) do
-        if isAuto(base(p)) then
-            local ok, data = pcall(rf, p)
-            local t = ok and dec(data) or nil
-            if t then
+        local ok, data = pcall(rf, p)
+        local t = ok and dec(data) or nil
+        if t and looksAuto(t) then
                 local nTop, maxTop = 0, 0
                 if type(t.tops) == "table" then
                     for _, v in pairs(t.tops) do
@@ -520,12 +590,44 @@ local function reportValues()
                         end
                     end
                 end
-                log(("values: lead=%s clock=%s tops=%d climb=%d/%.2f"):format(
-                    tostring(lead), tostring(t.clockOffset), nTop, nClimb, maxClimb))
-            end
+                log(("values: lead=%s clock=%s tops=%d/%.2f climb=%d/%.2f"):format(
+                    tostring(lead), tostring(t.clockOffset),
+                    nTop, maxTop, nClimb, maxClimb))
+                if maxClimb > 0 and CFG.climbBand
+                    and maxClimb >= CFG.climbBand - 0.002 then
+                    log("climb is at the cap - raise climbBand to 0.10")
+                end
             break
         end
     end
+end
+
+local hookOK = false
+if writeName then
+    hookOK = installHook(writeName, "writefile", function(call)
+        return function(path, data, ...)
+            local out = cleanData(path, data, true)
+            return call(path, out or data, ...)
+        end
+    end)
+end
+
+local function selfTest()
+    local rf = rawIO.readfile or readfile
+    local wf = rawIO.writefile or writefile
+    if not rf or not wf then return false end
+    local probe = "autotime_probe.json"
+    if not pcall(wf, probe, '{"tops":{"Probe":9},"clockOffset":9}') then
+        return nil
+    end
+    local ok, data = pcall(rf, probe)
+    local passed = false
+    if ok and type(data) == "string" then
+        local t = dec(data)
+        if t and type(t.tops) == "table" and t.tops.Probe == 0 then passed = true end
+    end
+    if delfile then pcall(delfile, probe) else pcall(wf, probe, "{}") end
+    return passed
 end
 
 if readfile and writefile then
@@ -541,16 +643,23 @@ if readfile and writefile then
         reportPaths()
         reportValues()
     end
+    if hookOK and CFG.selfTest and CFG.sniff then
+        local st = selfTest()
+        if st == true then
+            log("hook verified - saves are being cleaned")
+        elseif st == false then
+            hookOK = false
+            warnLog("hook NOT verified - file watchdog only")
+            warnLog("re-execute SynthHub then run this again")
+        else
+            log("hook installed (cannot self-test here)")
+        end
+    elseif not hookOK then
+        log("no write hook - using file watchdog only")
+    end
 else
     warnLog("executor has no readfile/writefile - file fix disabled")
 end
-
-installHook("writefile", function(call)
-    return function(path, data, ...)
-        local out = cleanData(path, data, true)
-        return call(path, out or data, ...)
-    end
-end)
 
 if CFG.watchdog and readfile and writefile then
     task.spawn(function()
@@ -558,7 +667,7 @@ if CFG.watchdog and readfile and writefile then
         while true do
             for p in pairs(paths) do cleanFile(p, true) end
             tick = tick + 1
-            if tick % 10 == 0 then
+            if tick % 8 == 0 then
                 for p in pairs(discover()) do paths[p] = true end
             end
             task.wait(CFG.interval)
@@ -566,4 +675,4 @@ if CFG.watchdog and readfile and writefile then
     end)
 end
 
-log("active - re-execute SynthHub so it loads the cleaned state")
+log("DONE - now RE-EXECUTE SynthHub")
