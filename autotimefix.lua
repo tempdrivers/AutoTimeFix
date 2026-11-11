@@ -12,11 +12,17 @@ local CFG = {
     duration      = 8,      -- seconds before a notification fades
     maxMessages   = 6,      -- max notifications on screen at once
     showPaths     = true,   -- show which files were found + their values
-    leadBand      = 0.04,   -- leads outside +/-this snap to 0
-    clockBand     = 30,     -- clockOffset outside +/-this snaps to 0 (garbage guard)
-    climbBand     = 0.05,   -- per-shot learning cap. raise if stuck at the cap
-    topBand       = 0.05,   -- tops cap
-    contestBand   = 0.5,    -- contest step cap
+    -- two-stage filter: absurd value -> 0, plausible value -> clamped into band
+    clockReset    = 1.0,    -- clockOffset above this is garbage -> 0
+    clockBand     = 0.5,    -- clockOffset legal range (big = LATE)
+    climbReset    = 0.30,   -- per-shot value above this is garbage -> 0
+    climbBand     = 0.08,   -- per-shot learning range
+    topReset      = 0.30,
+    topBand       = 0.08,
+    leadReset     = 0.10,
+    leadBand      = 0.06,
+    contestBand   = 0.5,
+    bias          = 0,      -- global nudge: POSITIVE = later, NEGATIVE = earlier
     leadOverride  = nil,    -- force leads hard. nil = auto band check
     clockOverride = nil,    -- force clockOffset hard. nil = auto band check
     topOverride   = nil,    -- force every tops entry hard. nil = 0
@@ -250,39 +256,37 @@ local function cleanAuto(t, runtime)
     local changed = false
 
     if type(t.tops) ~= "table" then t.tops = {}; changed = true end
-    local tb = CFG.topBand or 0.05
+    local tb, tr = CFG.topBand or 0.08, CFG.topReset or 0.30
     for k, v in pairs(t.tops) do
         local nv
         if CFG.topOverride ~= nil then nv = CFG.topOverride
         elseif CFG.resetTops then nv = 0
-        elseif num(v) and v >= -tb and v <= tb then nv = v
-        else nv = 0 end
+        elseif not num(v) or math.abs(v) > tr then nv = 0
+        else nv = clamp(v, -tb, tb) end
         if v ~= nv then t.tops[k] = nv; changed = true end
     end
 
     local job = CFG.useJobId and jobId() or ""
-    local band = CFG.clockBand or 0.5
+    local cband, creset = CFG.clockBand or 0.5, CFG.clockReset or 1.0
+    local function fixClock(v)
+        if not num(v) or math.abs(v) > creset then return 0 end
+        return clamp(v, -cband, cband)
+    end
     if CFG.clockOverride ~= nil then
         if t.clockOffset ~= CFG.clockOverride then
             t.clockOffset = CFG.clockOverride; changed = true
         end
-    elseif job ~= "" then
-        if t.clockServer ~= job then
-            if t.clockOffset ~= 0 then t.clockOffset = 0; changed = true end
-            if t.clockServer ~= nil and t.clockServer ~= "" then
-                t.clockServer = ""; changed = true
-            end
-        else
-            local off = t.clockOffset
-            if not num(off) or off < -band or off > band then
-                t.clockOffset = 0; changed = true
-            end
+    elseif job ~= "" and t.clockServer ~= job then
+        if t.clockOffset ~= 0 then t.clockOffset = 0; changed = true end
+        if t.clockServer ~= nil and t.clockServer ~= "" then
+            t.clockServer = ""; changed = true
         end
     else
-        local off = t.clockOffset
-        if off ~= nil and (not num(off) or off < -band or off > band) then
-            t.clockOffset = 0; changed = true
+        local nv = fixClock(t.clockOffset)
+        if CFG.bias and CFG.bias ~= 0 then
+            nv = clamp(nv + CFG.bias, -cband, cband)
         end
+        if t.clockOffset ~= nv then t.clockOffset = nv; changed = true end
     end
     if t.clockServer == nil then t.clockServer = ""; changed = true end
 
@@ -293,9 +297,11 @@ local function cleanAuto(t, runtime)
                 changed = true
             end
         else
-            local cb = CFG.climbBand or 0.05
+            local cb, cr = CFG.climbBand or 0.08, CFG.climbReset or 0.30
             for k, v in pairs(t.climbs) do
-                local nv = (num(v) and v >= -cb and v <= cb) and v or 0
+                local nv
+                if not num(v) or math.abs(v) > cr then nv = 0
+                else nv = clamp(v, -cb, cb) end
                 if v ~= nv then t.climbs[k] = nv; changed = true end
             end
         end
@@ -307,12 +313,12 @@ local function cleanAuto(t, runtime)
     end
     if type(t.leads) == "table" then
         for k, v in pairs(t.leads) do
-            local lb = CFG.leadBand or 0.06
+            local lb, lr = CFG.leadBand or 0.06, CFG.leadReset or 0.10
             local nv
             if CFG.leadOverride ~= nil then nv = CFG.leadOverride
             elseif CFG.wipeLearned then nv = 0
-            elseif num(v) and v >= -lb and v <= lb then nv = v
-            else nv = 0 end
+            elseif not num(v) or math.abs(v) > lr then nv = 0
+            else nv = clamp(v, -lb, lb) end
             if v ~= nv then t.leads[k] = nv; changed = true end
         end
     end
@@ -343,8 +349,8 @@ local function cleanContest(t)
     for k, v in pairs(t.steps) do
         local nv
         if CFG.resetContest then nv = 0
-        elseif num(v) and v >= -cb and v <= cb then nv = v
-        else nv = 0 end
+        elseif not num(v) or math.abs(v) > 1.0 then nv = 0
+        else nv = clamp(v, -cb, cb) end
         if v ~= nv then t.steps[k] = nv; changed = true end
     end
     for k, v in pairs(t.seen) do
@@ -593,9 +599,16 @@ local function reportValues()
                 log(("values: lead=%s clock=%s tops=%d/%.2f climb=%d/%.2f"):format(
                     tostring(lead), tostring(t.clockOffset),
                     nTop, maxTop, nClimb, maxClimb))
+                local co = type(t.clockOffset) == "number" and t.clockOffset or 0
+                local cbd = CFG.clockBand or 0.5
+                if co > 0 and co >= cbd - 0.002 then
+                    log("clock maxed LATE - set bias = -0.05")
+                elseif co < 0 and co <= -cbd + 0.002 then
+                    log("clock maxed EARLY - set bias = 0.05")
+                end
                 if maxClimb > 0 and CFG.climbBand
                     and maxClimb >= CFG.climbBand - 0.002 then
-                    log("climb is at the cap - raise climbBand to 0.10")
+                    log("climb at cap - raise climbBand to 0.15")
                 end
             break
         end
