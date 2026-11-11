@@ -494,7 +494,8 @@ local function cleanFile(path, runtime)
     if not wok then
         if not warned[path] then
             warned[path] = true
-            warnLog("cannot write " .. path .. " (read-only?) - unlock it and rerun")
+            warnLog("cannot write " .. base(path))
+            warnLog("PC: attrib -R " .. base(path))
             warnLog("reason: " .. tostring(err))
         end
         return false
@@ -606,7 +607,10 @@ local function reportValues()
                 elseif co < 0 and co <= -cbd + 0.002 then
                     log("clock maxed EARLY - set bias = 0.05")
                 end
-                if maxClimb > 0 and CFG.climbBand
+                if maxClimb > (CFG.climbReset or 0.30) then
+                    warnLog(("climb stuck at %.2f"):format(maxClimb))
+                    warnLog("file not writable? PC: attrib -R")
+                elseif maxClimb > 0 and CFG.climbBand
                     and maxClimb >= CFG.climbBand - 0.002 then
                     log("climb at cap - raise climbBand to 0.15")
                 end
@@ -626,8 +630,14 @@ if writeName then
 end
 
 local function selfTest()
-    local rf = rawIO.readfile or readfile
-    local wf = rawIO.writefile or writefile
+    local function globalFn(n)
+        if not n then return nil end
+        local f = rawget(genv, n)
+        if type(f) ~= "function" then f = rawget(_G, n) end
+        return f
+    end
+    local rf = globalFn(readName) or rawIO.readfile or readfile
+    local wf = globalFn(writeName) or rawIO.writefile or writefile
     if not rf or not wf then return false end
     local probe = "autotime_probe.json"
     if not pcall(wf, probe, '{"tops":{"Probe":9},"clockOffset":9}') then
