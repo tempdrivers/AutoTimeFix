@@ -1,6 +1,7 @@
 local CFG = {
     watchdog      = true,   -- keep re-cleaning while the game is open
-    interval      = 0.2,    -- seconds between watchdog passes (fast on mobile)
+    interval      = 0.2,    -- seconds between watchdog passes
+    blockWrites   = true,   -- SynthHub itself may NOT edit these files
     verbose       = true,   -- print what it does
     resetTops     = false,  -- keep small learned tops (bounded by topBand)
     resetContest  = false,  -- keep small contest steps (bounded by contestBand)
@@ -515,7 +516,7 @@ local warned = {}
 local verified = {}
 local function cleanFile(path, runtime)
     local rf = rawIO.readfile or readfile
-    local wf = rawIO.writefile or writefile
+    local wf = rawIO.rawWrite or rawIO.writefile or writefile
     if not rf or not wf then return false end
     local ok, data = pcall(rf, path)
     if not ok or type(data) ~= "string" then return false end
@@ -547,6 +548,9 @@ end
 local function installHook(name, key, factory)
     local orig = getfn(name)
     if not orig then return false end
+    -- keep the untouched function so our own writes can bypass the hook
+    if key == "writefile" then rawIO.rawWrite = orig end
+    if key == "appendfile" then rawIO.rawAppend = orig end
     local callOrig, active = orig, {}
     local function call(...)
         local co = coroutine.running() or "main"
@@ -653,10 +657,21 @@ local function reportValues()
 end
 
 local hookOK = false
+local dirtyWrites = {}
+local blockedCount = 0
 if writeName then
+    local function isProtected(p)
+        local n = base(tostring(p))
+        return isAuto(n) or isContest(n)
+    end
     hookOK = installHook(writeName, "writefile", function(call)
         return function(path, data, ...)
-            local out = cleanData(path, data, true)
+            local p = tostring(path)
+            if CFG.blockWrites and isProtected(p) then
+                blockedCount = (blockedCount or 0) + 1
+                return
+            end
+            local out = cleanData(p, data, true)
             return call(path, out or data, ...)
         end
     end)
@@ -670,20 +685,23 @@ local function selfTest()
         return f
     end
     local rf = globalFn(readName) or rawIO.readfile or readfile
-    local wf = globalFn(writeName) or rawIO.writefile or writefile
+    local wf = rawIO.rawWrite or globalFn(writeName) or rawIO.writefile or writefile
     if not rf or not wf then return false end
     local probe = "autotime_probe.json"
     if not pcall(wf, probe, '{"tops":{"Probe":9},"clockOffset":9}') then
         return nil
     end
+    local cleaned = cleanFile(probe, false)
     local ok, data = pcall(rf, probe)
     local passed = false
     if ok and type(data) == "string" then
         local t = dec(data)
         if t and type(t.tops) == "table" and t.tops.Probe == 0 then passed = true end
     end
+    dirtyWrites[probe] = nil
+    paths[probe] = nil
     if delfile then pcall(delfile, probe) else pcall(wf, probe, "{}") end
-    return passed
+    return passed and cleaned ~= false
 end
 
 --=====================================================================
@@ -815,14 +833,14 @@ if CFG.watchdog and readfile and writefile then
         local tick = 0
         while true do
             for p in pairs(paths) do cleanFile(p, true) end
+            tick = tick + 1
+            if tick % 25 == 0 then
+                for p in pairs(discover()) do paths[p] = true end
+            end
             if CFG.autoReload and lateDrift > 0
                 and (os.clock() - lastReload) > (CFG.reloadCooldown or 300) then
                 lastReload = os.clock()
                 reloadSynthHub(false)
-            end
-            tick = tick + 1
-            if tick % 25 == 0 then
-                for p in pairs(discover()) do paths[p] = true end
             end
             task.wait(CFG.interval)
         end
