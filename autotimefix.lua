@@ -74,47 +74,10 @@ local delfile              = resolve("delfile", "delete_file", "remove_file")
 local HS        = game:GetService("HttpService")
 local rawIO: {[string]: any} = { readfile = readfile, writefile = writefile }
 
--- Remember SynthHub's loader so FIX TIMING can re-run it without the user
--- pasting anything into reloadCode. Only a real script (big enough) counts.
-local capturedReload = ""
-do
-    local loadName = getfn("loadstring") and "loadstring" or (getfn("load") and "load" or nil)
-    local capOrig = loadName and getfn(loadName) or nil
-    if capOrig then
-        local function remember(a, b)
-            local src = a
-            if type(b) == "string" then src = b end
-            if type(src) == "string" and #src >= 800
-                and not src:find("AutoTimeFix", 1, true)
-                and not src:find("autotime_fix", 1, true)
-                and not src:find("autotime_probe", 1, true) then
-                if #src > #capturedReload then capturedReload = src end
-            end
-        end
-        local hooker = getfn("hookfunction") or getfn("replaceclosure")
-            or getfn("hookfunc") or getfn("detourfunction")
-        local done = false
-        if hooker then
-            done = pcall(function()
-                local ret = hooker(capOrig, function(a, b, c)
-                    remember(a, b)
-                    return capOrig(a, b, c)
-                end)
-                if type(ret) ~= "function" then error("no hook") end
-            end)
-        end
-        if not done then
-            -- no hookfunction on this build: wrap the global instead
-            pcall(function()
-                local wrapped = function(a, b, c)
-                    remember(a, b)
-                    return capOrig(a, b, c)
-                end
-                if rawset(genv, loadName, wrapped) then rawIO.rawLoad = capOrig end
-            end)
-        end
-    end
-end
+-- NOTE: this script never hooks loadstring / load. Luarmor-style loaders do
+-- `loadstring(game:HttpGet(...))()` at line 1, and hooking it there causes
+-- "C stack overflow" in loadstring. FIX TIMING re-runs SynthHub only from the
+-- code you paste into `reloadCode`.
 
 --=====================================================================
 -- on-screen notifications (no console spam)
@@ -810,19 +773,20 @@ end
 --=====================================================================
 local function reloadSynthHub(quiet)
     local code = tostring(CFG.reloadCode or "")
-    if code == "" and capturedReload and #capturedReload >= 800 then
-        code = capturedReload
-    end
     if code == "" then
         if not quiet then log("files cleaned - now RE-EXECUTE SynthHub") end
         return false
     end
-    local f = rawIO.rawLoad or loadstring or load
+    local f = loadstring or load
     if not f then
         warnLog("loadstring blocked - re-execute SynthHub by hand")
         return false
     end
-    local chunk, err = f(code)
+    local fok, chunk, err = pcall(f, code)
+    if not fok then
+        warnLog("loader failed: " .. tostring(chunk))
+        return false
+    end
     if not chunk then
         warnLog("reloadCode error: " .. tostring(err))
         return false
@@ -959,6 +923,7 @@ if CFG.watchdog and readfile and writefile then
                 for p in pairs(discover()) do paths[p] = true end
             end
             if CFG.autoReload and lateDrift > 0
+                and tostring(CFG.reloadCode or "") ~= ""
                 and (os.clock() - lastReload) > (CFG.reloadCooldown or 300) then
                 lastReload = os.clock()
                 lateDrift = 0
