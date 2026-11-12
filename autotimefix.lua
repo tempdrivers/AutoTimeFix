@@ -629,6 +629,7 @@ local function installHook(name, key, factory)
             if ok and type(ret) == "function" then
                 callOrig = ret
                 rawIO[key] = ret
+                rawIO.mode = hn
                 log(key .. " hooked via " .. hn)
                 return true
             end
@@ -642,6 +643,7 @@ local function installHook(name, key, factory)
     end
     if assign(genv) or assign(_G) then
         rawIO[key] = wrapper
+        rawIO.mode = "wrapped"
         log(key .. " wrapped (no hookfunction)")
         return true
     end
@@ -715,7 +717,6 @@ local function reportValues()
 end
 
 local hookOK = false
-local dirtyWrites = {}
 local blockedCount = 0
 local blockedWarned = false
 local driftWarned = false
@@ -788,31 +789,20 @@ if readName and CFG.sanitizeReads ~= false then
     end)
 end
 
+-- Proves the cleaning pipeline works, entirely in memory. No disk writes, so
+-- it cannot be fooled by a sandboxed / read-only / delayed executor file.
 local function selfTest()
-    local function globalFn(n)
-        if not n then return nil end
-        local f = rawget(genv, n)
-        if type(f) ~= "function" then f = rawget(_G, n) end
-        return f
-    end
-    local rf = rawIO.rawRead or globalFn(readName) or rawIO.readfile or readfile
-    local wf = rawIO.rawWrite or globalFn(writeName) or rawIO.writefile or writefile
-    if not rf or not wf then return false end
-    local probe = "autotime_probe.json"
-    if not pcall(wf, probe, '{"tops":{"Probe":9},"clockOffset":9}') then
-        return nil
-    end
-    local cleaned = cleanFile(probe, false)
-    local ok, data = pcall(rf, probe)
-    local passed = false
-    if ok and type(data) == "string" then
-        local t = dec(data)
-        if t and type(t.tops) == "table" and t.tops.Probe == 0 then passed = true end
-    end
-    dirtyWrites[probe] = nil
-    paths[probe] = nil
-    if delfile then pcall(delfile, probe) else pcall(wf, probe, "{}") end
-    return passed and cleaned ~= false
+    local probe = '{"tops":{"Probe":9},"clockOffset":9,'
+        .. '"climbs":{"Probe":9},"leads":{"Probe":-9}}'
+    local out = cleanData("autotime.json", probe, false)
+    if type(out) ~= "string" then return false end
+    local t = dec(out)
+    if not t then return false end
+    if type(t.tops) ~= "table" or t.tops.Probe ~= 0 then return false end
+    if t.clockOffset ~= 0 then return false end
+    if type(t.climbs) == "table" and t.climbs.Probe ~= 0 then return false end
+    if type(t.leads) == "table" and t.leads.Probe ~= 0 then return false end
+    return true
 end
 
 --=====================================================================
@@ -912,6 +902,8 @@ local function makeReloadButton()
 end
 
 if readfile and writefile then
+    -- older builds left a test file behind; get rid of it
+    if delfile then pcall(delfile, "autotime_probe.json") end
     if CFG.cleanNow then
         local found, cleaned = 0, 0
         for p in pairs(paths) do
@@ -924,25 +916,25 @@ if readfile and writefile then
         reportPaths()
         reportValues()
     end
-    if hookOK and CFG.selfTest and CFG.sniff then
-        local st = selfTest()
-        if st == true then
-            log("hook verified - saves are being cleaned")
-        elseif st == false then
-            hookOK = false
-            warnLog("hook NOT verified - file watchdog only")
-            warnLog("re-execute SynthHub then run this again")
+    if CFG.selfTest ~= false then
+        if selfTest() then
+            log("cleaner verified - timing values capped")
         else
-            log("hook installed (cannot self-test here)")
+            warnLog("cleaner self-test failed - re-run the script")
         end
-    elseif not hookOK then
-        log("no write hook - using file watchdog only")
     end
     if CFG.blockWrites then
-        if readOK then
+        local weak = rawIO.mode == "wrapped"
+        if hookOK and readOK and not weak then
             log("reads + saves blocked - SynthHub cannot drift")
-        else
+        elseif hookOK and readOK then
+            log("reads + saves blocked (soft mode)")
+            log("RE-EXECUTE SynthHub once so it uses it")
+        elseif hookOK then
             warnLog("saves blocked, reads NOT - drift may continue")
+            warnLog("re-execute SynthHub then run this again")
+        else
+            log("executor blocks hooks - using file watchdog")
         end
     end
 else
