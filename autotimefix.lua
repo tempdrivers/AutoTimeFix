@@ -18,29 +18,36 @@ local CFG = {
     -- Every value is CLAMPED continuously. Nothing is ever snapped back to 0
     -- inside the normal range, because that jump is what makes the greens
     -- alternate between "too early" and "too late" after a few minutes.
+    -- The LATE side is deliberately much tighter than the EARLY side:
+    -- a release that is a bit early still greens, a late release gets
+    -- rejected by the game and the shot counts as a miss.
     clockReset    = 3.0,    -- only insane values are zeroed (never in normal play)
-    clockEarly    = 0.30,   -- how far the clock may go toward EARLY
-    clockLate     = 0.14,   -- how far the clock may go toward LATE (positive = late)
+    clockEarly    = 0.20,   -- how far the clock may go toward EARLY
+    clockLate     = 0.02,   -- how far the clock may go toward LATE (positive = late)
     climbReset    = 2.0,    -- only insane values are zeroed (never in normal play)
-    climbEarly    = 0.06,   -- how far a climb may go toward EARLY
-    climbLate     = 0.04,   -- how far a climb may go toward LATE (positive = late)
+    climbEarly    = 0.04,   -- how far a climb may go toward EARLY
+    climbLate     = 0.02,   -- how far a climb may go toward LATE (positive = late)
     topReset      = 2.0,
-    topBand       = 0.04,   -- tops are kept symmetric, direction not proven
+    topBand       = 0.025,  -- tops are kept symmetric, direction not proven
     leadReset     = 2.0,
-    leadEarly     = 0.06,   -- lead positive = EARLY
-    leadLate      = 0.055,  -- lead negative = LATE (magnitude)
-    contestBand   = 0.5,
+    leadEarly     = 0.04,   -- lead positive = EARLY
+    leadLate      = 0.02,   -- lead negative = LATE (magnitude)
+    -- The lead of the shot type and the climb of that animation are BOTH
+    -- added to the release, so each of them being legal is not enough: the
+    -- SUM has to stay inside the window the game accepts. This is the budget
+    -- for how late the two together may be. It is what stops the late drift
+    -- that only shows up after a few minutes of shooting.
+    lateBudget    = 0.04,   -- lead + climb may be at most this much late
+    contestBand   = 0.25,
     bias          = 0,      -- shifts both limits: -0.05 = earlier, 0.05 = later
-    autoReload    = true,   -- reload SynthHub if late drift is detected
-    reloadCooldown= 120,    -- min seconds between drift-triggered reloads
-    reloadEvery   = 300,    -- also re-run SynthHub every N s (0 = off). Needs reloadCode.
-    reloadCode    = "",     -- paste SynthHub's loadstring here -> FIX TIMING button
+    liveSync      = true,   -- pull the in-memory copy back to the clean file
     leadOverride  = nil,    -- force leads hard. nil = auto band check
     clockOverride = nil,    -- force clockOffset hard. nil = auto band check
     topOverride   = nil,    -- force every tops entry hard. nil = 0
     extraPaths    = {},     -- extra file/folder paths for mobile, e.g. {"/sdcard/..."}
     selfTest      = true,   -- verify the write hook actually intercepts writes
     sniff         = true,   -- find files by their content, not just the filename
+    liveClamp     = true,   -- also clamp the copy SynthHub holds IN MEMORY
 }
 
 
@@ -76,10 +83,10 @@ local delfile              = resolve("delfile", "delete_file", "remove_file")
 local HS        = game:GetService("HttpService")
 local rawIO: {[string]: any} = { readfile = readfile, writefile = writefile }
 
--- NOTE: this script never hooks loadstring / load. Luarmor-style loaders do
--- `loadstring(game:HttpGet(...))()` at line 1, and hooking it there causes
--- "C stack overflow" in loadstring. FIX TIMING re-runs SynthHub only from the
--- code you paste into `reloadCode`.
+-- NOTE: this script never touches loadstring / load, not even to call them.
+-- Luarmor-style loaders do `loadstring(game:HttpGet(...))()` at line 1, and
+-- hooking or wrapping that causes "C stack overflow" in loadstring. Everything
+-- here works on the files and on the live timing table, nothing else.
 
 -- The EARLIER / LATER buttons save their setting here so it survives a
 -- re-execute. A plain number, no JSON.
@@ -252,9 +259,16 @@ local function enc(t)
     local ok, s = pcall(function() return HS:JSONEncode(t) end)
     return ok and type(s) == "string" and s or nil
 end
+-- tables we decoded ourselves are never the live in-memory state, they are
+-- just a copy of the file. Remember them so the live scan skips them.
+local ownTables = setmetatable({}, { __mode = "k" })
 local function dec(s)
     local ok, t = pcall(function() return HS:JSONDecode(s) end)
-    return ok and type(t) == "table" and t or nil
+    if ok and type(t) == "table" then
+        ownTables[t] = true
+        return t
+    end
+    return nil
 end
 local function base(p)
     p = tostring(p):gsub("\\", "/")
@@ -310,7 +324,7 @@ local function jobId()
 end
 
 -- wall-clock seconds. os.time() keeps counting while the game is idle, unlike
--- a CPU-time clock, which would make the automatic reload never fire.
+-- a CPU-time clock, which would make the watchdogs never fire.
 local function nowSec()
     local t = os.time()
     if type(t) == "number" and t > 0 then return t end
@@ -318,7 +332,98 @@ local function nowSec()
 end
 
 
-local lateDrift, lastReload = 0, 0
+local lateDrift = 0
+
+-- per-animation learned tops. Those lists can hold counts (whole numbers)
+-- as well as offsets, so only fractional numbers are treated as offsets.
+local function clampTopList(list, band, depth)
+    local changed = false
+    if type(list) ~= "table" then return false end
+    for k, v in pairs(list) do
+        if num(v) then
+            local a = math.abs(v)
+            if a > 0.000001 and a % 1 ~= 0 then
+                local nv = clamp(v, -band, band)
+                if nv ~= v then list[k] = nv; changed = true end
+            end
+        elseif type(v) == "table" and (depth or 0) < 2 then
+            if clampTopList(v, band, (depth or 0) + 1) then changed = true end
+        end
+    end
+    return changed
+end
+
+-- how late one value is (positive number = late)
+local function lateOf(v, lateIsNegative)
+    if not num(v) then return 0 end
+    if lateIsNegative then
+        return v < 0 and -v or 0
+    end
+    return v > 0 and v or 0
+end
+
+-- the worst (most late) value inside a map
+local function mapLateMax(map, lateIsNegative)
+    local m = 0
+    if type(map) ~= "table" then return 0 end
+    for _, v in pairs(map) do
+        if num(v) then
+            local a = lateOf(v, lateIsNegative)
+            if a > m then m = a end
+        end
+    end
+    return m
+end
+
+-- The lead of the shot type and the climb of that animation are BOTH added
+-- to the release. So a lead of -0.02 together with a climb of +0.02 is
+-- 40 ms late, even though BOTH of them are inside their own limits.
+-- That sum is what the game rejects, so the two share ONE budget.
+-- Values are only ever pulled towards EARLY here, so this can never make a
+-- shot later than it already was.
+local function applyLateBudget(leads, climbs)
+    local budget = CFG.lateBudget or 0.04
+    if not num(budget) or budget <= 0 then return false end
+    -- the bias moves both windows, so the budget moves with it, otherwise
+    -- the LATER button would fight the budget
+    local b = num(CFG.bias) and CFG.bias or 0
+    budget = budget + b
+    if type(leads) ~= "table" and type(climbs) ~= "table" then return false end
+    local changed = false
+    local function total()
+        return mapLateMax(leads, true) + mapLateMax(climbs, false)
+    end
+    for _ = 1, 64 do
+        local cur = total()
+        if cur <= budget + 0.000001 then break end
+        local excess = cur - budget
+        local cl = mapLateMax(climbs, false)
+        local ld = mapLateMax(leads, true)
+        local touched = false
+        -- take it off the climbs first, they are the ones that wind up
+        if cl > 0 and cl >= ld then
+            for k, v in pairs(climbs) do
+                if num(v) and v > 0 then
+                    local nv = v - excess
+                    if nv < 0 then nv = 0 end
+                    if nv ~= v then climbs[k] = nv; changed = true; touched = true end
+                    break
+                end
+            end
+        elseif ld > 0 then
+            for k, v in pairs(leads) do
+                if num(v) and v < 0 then
+                    local nv = v + excess
+                    if nv > 0 then nv = 0 end
+                    if nv ~= v then leads[k] = nv; changed = true; touched = true end
+                    break
+                end
+            end
+        end
+        if not touched then break end
+    end
+    return changed
+end
 
 local function cleanAuto(t, runtime)
     if type(t) ~= "table" then return nil, false end
@@ -329,7 +434,7 @@ local function cleanAuto(t, runtime)
     local changed = false
 
     if type(t.tops) ~= "table" then t.tops = {}; changed = true end
-    local tb, tr = CFG.topBand or 0.04, CFG.topReset or 0.12
+    local tb, tr = CFG.topBand or 0.025, CFG.topReset or 2.0
     for k, v in pairs(t.tops) do
         local nv
         if CFG.topOverride ~= nil then nv = CFG.topOverride
@@ -340,8 +445,8 @@ local function cleanAuto(t, runtime)
     end
 
     local job = CFG.useJobId and jobId() or ""
-    local ce, cl = CFG.clockEarly or 0.30, CFG.clockLate or 0.12
-    local creset = CFG.clockReset or 0.8
+    local ce, cl = CFG.clockEarly or 0.20, CFG.clockLate or 0.02
+    local creset = CFG.clockReset or 3.0
     local function fixClock(v)
         if not num(v) or math.abs(v) > creset then return 0 end
         return clampBand(v, ce, cl, false, CFG.bias)
@@ -375,8 +480,8 @@ local function cleanAuto(t, runtime)
                 changed = true
             end
         else
-            local ce2, cl2 = CFG.climbEarly or 0.06, CFG.climbLate or 0.02
-            local cr = CFG.climbReset or 0.12
+            local ce2, cl2 = CFG.climbEarly or 0.04, CFG.climbLate or 0.02
+            local cr = CFG.climbReset or 2.0
             for k, v in pairs(t.climbs) do
                 if num(v) and v > cl2 + 0.08 then lateDrift = lateDrift + 1 end
                 local nv
@@ -393,8 +498,8 @@ local function cleanAuto(t, runtime)
     end
     if type(t.leads) == "table" then
         for k, v in pairs(t.leads) do
-            local le, ll = CFG.leadEarly or 0.06, CFG.leadLate or 0.05
-            local lr = CFG.leadReset or 0.08
+            local le, ll = CFG.leadEarly or 0.04, CFG.leadLate or 0.02
+            local lr = CFG.leadReset or 2.0
             if num(v) and v < -(ll + 0.06) then lateDrift = lateDrift + 1 end
             local nv
             if CFG.leadOverride ~= nil then nv = CFG.leadOverride
@@ -409,6 +514,8 @@ local function cleanAuto(t, runtime)
         for k in pairs(t.leadSeen) do t.leadSeen[k] = nil end
         changed = true
     end
+    -- per shot type / per animation tops are offsets too, and they used to
+    -- be left completely alone here, so they could drift for ever
     if CFG.wipeLearned then
         for _, key in ipairs({ "typeTops", "animTops" }) do
             local arr = t[key]
@@ -417,7 +524,20 @@ local function cleanAuto(t, runtime)
                 changed = true
             end
         end
+    else
+        for _, key in ipairs({ "typeTops", "animTops" }) do
+            local arr = t[key]
+            if type(arr) == "table" then
+                for _, list in pairs(arr) do
+                    if clampTopList(list, tb, 0) then changed = true end
+                end
+                if clampTopList(arr, tb, 0) then changed = true end
+            end
+        end
     end
+    -- the lead and the climb of one shot are added together, so the two
+    -- have to share one budget for how late the release may be
+    if applyLateBudget(t.leads, t.climbs) then changed = true end
     return t, changed
 end
 
@@ -427,7 +547,7 @@ local function cleanContest(t)
         return nil, false
     end
     local changed = false
-    local cb = CFG.contestBand or 0.5
+    local cb = CFG.contestBand or 0.25
     for k, v in pairs(t.steps) do
         local nv
         if CFG.resetContest then nv = 0
@@ -462,6 +582,340 @@ local function cleanData(path, data, runtime, force)
     else _, changed = cleanContest(t) end
     if not changed and not force then return nil end
     return enc(t)
+end
+
+--=====================================================================
+-- LIVE IN-MEMORY CLAMP
+--
+-- Clamping the JSON file is not enough. SynthHub keeps its own copy of
+-- these numbers in memory and keeps adding to it; that copy is what the
+-- shot actually uses. So after a few minutes it shoots late even though
+-- the file on disk is perfect. Find that live table and clamp it in
+-- place on every pass.
+--=====================================================================
+local liveStates = setmetatable({}, { __mode = "k" })
+local liveFound = false
+local liveLocked = false
+local liveMissed = false
+-- the clean file contents, used as the baseline the live copy follows
+local cleanState = nil
+local cleanSave = nil
+local cleanSaveAt = 0
+
+-- A live timing table looks like the JSON SynthHub keeps: maps of learned
+-- offsets named "tops", "climbs" and "leads". Two of those together is
+-- specific enough that a random table will not match, and the string keys
+-- rule out index arrays.
+local LIVE_MAPS = { "tops", "climbs", "leads" }
+
+-- the field names SynthHub uses for its timing state. A table that carries
+-- several of them is the timing state, whatever shape it is stored in.
+local SYNTH_FIELDS = { "tops", "climbs", "leads", "typeTops", "animTops",
+    "clockOffset", "clockServer", "climbSeen", "leadSeen", "version" }
+local SYNTH_MAPFIELDS = { tops = true, climbs = true, leads = true }
+
+-- The timing maps can sit on the state table itself or one level down in
+-- it. Find the table that actually holds them. Only a limited number of
+-- children is looked at, so a huge table cannot slow the scan down.
+local function mapHolder(t)
+    if type(t) ~= "table" then return nil end
+    for _, k in ipairs(LIVE_MAPS) do
+        if type(t[k]) == "table" then return t end
+    end
+    local n = 0
+    for _, v in pairs(t) do
+        n = n + 1
+        if n > 40 then return nil end
+        if type(v) == "table" then
+            for _, k in ipairs(LIVE_MAPS) do
+                if type(v[k]) == "table" then return v end
+            end
+        end
+    end
+    return nil
+end
+
+-- Fast check, no table walking: does this table hold SynthHub's timing
+-- maps directly? The maps do NOT have to contain a number yet - a state
+-- table that starts out empty still has to be found, otherwise the values
+-- it learns later would never be clamped and the shot would drift late.
+local function isLiveState(t)
+    if type(t) ~= "table" then return false end
+    if ownTables[t] then return false end
+    local maps, hits = 0, 0
+    for i = 1, #SYNTH_FIELDS do
+        local k = SYNTH_FIELDS[i]
+        local v = t[k]
+        if v ~= nil then
+            hits = hits + 1
+            if SYNTH_MAPFIELDS[k] and type(v) == "table" then
+                maps = maps + 1
+            end
+        end
+    end
+    -- two of the three maps plus several of SynthHub's own field names:
+    -- that combination is far too specific to happen by accident
+    if maps < 2 or hits < 3 then return false end
+    -- the maps must not be plain index arrays
+    local strk, anyVal = false, false
+    for _, k in ipairs(LIVE_MAPS) do
+        local m = t[k]
+        if type(m) == "table" then
+            for mk in pairs(m) do
+                anyVal = true
+                if type(mk) == "string" then strk = true end
+            end
+        end
+    end
+    if anyVal and not strk then return false end
+    return true
+end
+
+-- Same, but for a state table that keeps its maps one level down.
+local function findDeepHolder(t)
+    if type(t) ~= "table" then return nil end
+    if ownTables[t] then return nil end
+    local h = mapHolder(t)
+    if not h or h == t then return nil end
+    if not isLiveState(h) then return nil end
+    return h
+end
+
+-- Clamp a live map. A value that is still inside the window is left alone so
+-- the learner can keep working. A value that drifted OUT of the window is
+-- pulled back to the cap, or to the clean file value when that one is not
+-- worse (not later) than the cap.
+local function syncMap(liveMap, cleanMap, clampFn, laterFn)
+    local changed = false
+    if type(liveMap) ~= "table" then return false end
+    -- string keyed maps are real offset maps, array like ones only hold
+    -- fractional numbers we are allowed to touch
+    local strKeys = false
+    for k in pairs(liveMap) do
+        if type(k) == "string" then
+            strKeys = true
+            break
+        end
+    end
+    for k, v in pairs(liveMap) do
+        if num(v) then
+            local a = math.abs(v)
+            local allowed = strKeys or (a % 1 ~= 0)
+            if allowed and a <= 5 then
+                local nv = clampFn(v)
+                if nv ~= v and type(cleanMap) == "table" then
+                    local c = cleanMap[k]
+                    if num(c) then
+                        local bv = clampFn(c)
+                        local useBase
+                        if laterFn then
+                            useBase = not laterFn(bv, nv)
+                        else
+                            useBase = math.abs(bv) < math.abs(nv)
+                        end
+                        if useBase then nv = bv end
+                    end
+                end
+                if nv ~= v then liveMap[k] = nv; changed = true end
+            end
+        end
+    end
+    return changed
+end
+
+-- Clamp the table SynthHub is ACTUALLY shooting with. Only fields that
+-- already exist are touched, so we never add keys the script does not know.
+local function cleanLive(t)
+    if type(t) ~= "table" then return false end
+    -- the maps may sit on the table itself or one level down in it
+    local h = mapHolder(t) or t
+    local changed = false
+    local tb = CFG.topBand or 0.025
+    local ce, cl = CFG.climbEarly or 0.04, CFG.climbLate or 0.02
+    local le, ll = CFG.leadEarly or 0.04, CFG.leadLate or 0.02
+    local cce, ccl = CFG.clockEarly or 0.20, CFG.clockLate or 0.02
+    -- the file baseline is the good one, the save snapshot is the fallback
+    local cs = nil
+    if CFG.liveSync ~= false then cs = cleanState or cleanSave end
+
+    if type(h.tops) == "table" then
+        if syncMap(h.tops, cs and cs.tops,
+            function(v) return clamp(v, -tb, tb) end) then changed = true end
+    end
+
+    if type(h.climbs) == "table" then
+        -- a climb grows positive when it gets late
+        if syncMap(h.climbs, cs and cs.climbs,
+            function(v) return clampBand(v, ce, cl, false, CFG.bias) end,
+            function(a, b) return a > b end) then
+            changed = true
+        end
+    end
+
+    if type(h.leads) == "table" then
+        -- a lead grows negative when it gets late
+        if syncMap(h.leads, cs and cs.leads,
+            function(v) return clampBand(v, le, ll, true, CFG.bias) end,
+            function(a, b) return a < b end) then
+            changed = true
+        end
+    end
+
+    if type(h.typeTops) == "table" then
+        for _, arr in pairs(h.typeTops) do
+            if clampTopList(arr, tb, 0) then changed = true end
+        end
+    end
+    if type(h.animTops) == "table" then
+        if clampTopList(h.animTops, tb, 0) then changed = true end
+    end
+
+    if num(h.clockOffset) then
+        local job = CFG.useJobId and jobId() or ""
+        if job ~= "" and type(h.clockServer) == "string"
+            and h.clockServer ~= "" and h.clockServer ~= job then
+            -- offset learned on another server: drop it once
+            h.clockOffset = 0
+            h.clockServer = job
+            changed = true
+        else
+            local nv = clampBand(h.clockOffset, cce, ccl, false, CFG.bias)
+            if nv ~= h.clockOffset and cs and num(cs.clockOffset) then
+                -- the file value is only used when it is not later than the cap
+                local bv = clampBand(cs.clockOffset, cce, ccl, false, CFG.bias)
+                if bv <= nv then nv = bv end
+            end
+            if nv ~= h.clockOffset then h.clockOffset = nv; changed = true end
+        end
+    end
+
+    -- the lead of the shot and the climb of that animation are added
+    -- together, so the two share one budget for how late the release may be
+    if applyLateBudget(h.leads, h.climbs) then changed = true end
+    return changed
+end
+
+local function rememberLive(t, deep)
+    if liveStates[t] then return end
+    if not isLiveState(t) then
+        if not deep then return end
+        local h = findDeepHolder(t)
+        if not h then return end
+        liveStates[h] = true
+    else
+        liveStates[t] = true
+    end
+    if not liveFound then
+        liveFound = true
+        log("in-memory timing found - clamping it live")
+    end
+end
+
+-- Some executors only list functions in getgc. Then the timing table is
+-- still reachable through a closure upvalue, so look in there too.
+local function scanUpvalues()
+    local dbg = rawget(genv, "debug") or rawget(_G, "debug")
+    local gu
+    if type(dbg) == "table" then gu = rawget(dbg, "getupvalues") end
+    if type(gu) ~= "function" then gu = getfn("getupvalues") end
+    if type(gu) ~= "function" then return 0 end
+    local getgcFn = getfn("getgc")
+    if not getgcFn then return 0 end
+    local ok, gc = pcall(getgcFn, true)
+    if not ok or type(gc) ~= "table" then ok, gc = pcall(getgcFn) end
+    if not ok or type(gc) ~= "table" then return 0 end
+    local n = 0
+    pcall(function()
+        for i = 1, math.min(#gc, 20000) do
+            local f = gc[i]
+            if type(f) == "function" then
+                local uok, ups = pcall(gu, f)
+                if uok and type(ups) == "table" then
+                    for _, u in pairs(ups) do
+                        if type(u) == "table" and (isLiveState(u) or findDeepHolder(u)) then
+                            rememberLive(u, true)
+                            n = n + 1
+                        end
+                    end
+                end
+            end
+            if liveFound then break end
+        end
+    end)
+    return n
+end
+
+local function scanLive(nodeBudget, maxDepth, useGC)
+    local seen, nodes = {}, 0
+    local function visit(t, depth)
+        if type(t) ~= "table" or seen[t] or nodes >= nodeBudget then return end
+        seen[t] = true
+        nodes = nodes + 1
+        rememberLive(t, true)
+        if depth >= (maxDepth or 5) then return end
+        local ok = pcall(function()
+            local k, v = next(t)
+            while k ~= nil do
+                if type(v) == "table" then visit(v, depth + 1) end
+                k, v = next(t, k)
+            end
+        end)
+        if not ok then return end
+    end
+
+    local roots = { genv, _G }
+    if type(shared) == "table" then roots[#roots + 1] = shared end
+    pcall(function()
+        local dbg = rawget(genv, "debug") or rawget(_G, "debug")
+        if type(dbg) ~= "table" then return end
+        local gr = rawget(dbg, "getregistry")
+        if type(gr) ~= "function" then return end
+        local ok, reg = pcall(gr)
+        if ok and type(reg) == "table" then roots[#roots + 1] = reg end
+    end)
+    for _, r in ipairs(roots) do pcall(visit, r, 0) end
+
+    if useGC then
+        local getgcFn = getfn("getgc")
+        if getgcFn then
+            local ok, gc = pcall(getgcFn, true)
+            if not ok or type(gc) ~= "table" then ok, gc = pcall(getgcFn) end
+            if ok and type(gc) == "table" then
+                pcall(function()
+                    for i = 1, math.min(#gc, 60000) do
+                        local v = gc[i]
+                        if type(v) == "table" and isLiveState(v) then
+                            rememberLive(v)
+                        end
+                    end
+                end)
+            end
+        end
+        -- still nothing? the table may sit in a closure upvalue
+        if not liveFound then scanUpvalues() end
+    end
+    return nodes
+end
+
+local function clampLive()
+    if CFG.liveClamp == false then return 0 end
+    local n = 0
+    pcall(function()
+        for t in pairs(liveStates) do
+            if isLiveState(t) then
+                local ok, changed = pcall(cleanLive, t)
+                if ok then
+                    if changed then n = n + 1 end
+                elseif not liveLocked then
+                    liveLocked = true
+                    warnLog("in-memory timing is locked - re-execute SynthHub once")
+                end
+            else
+                liveStates[t] = nil
+            end
+        end
+    end)
+    return n
 end
 
 
@@ -576,6 +1030,12 @@ local function cleanFile(path, runtime, force)
     local ok, data = pcall(rf, path)
     if not ok or type(data) ~= "string" then return false end
     local out = cleanData(path, data, runtime, force)
+    -- remember the clean copy: the live table in memory is pulled back to it,
+    -- so the running game can never be later than the file
+    if isAuto(base(path)) then
+        local ct = dec(out or data)
+        if ct and looksAuto(ct) then cleanState = ct end
+    end
     if not out then return false end
     local wok, err = pcall(wf, path, out)
     if not wok then
@@ -703,30 +1163,78 @@ local function reportValues()
                         end
                     end
                 end
-                log(("values: lead=%s clock=%s tops=%d/%.2f climb=%d/%.2f"):format(
+                -- how late one shot really is: the lead of the shot type
+                -- plus the climb of that animation are added together
+                local late = mapLateMax(t.leads, true) + mapLateMax(t.climbs, false)
+                local budget = CFG.lateBudget or 0.04
+                log(("values: lead=%s clock=%s tops=%d/%.2f climb=%d/%.2f late=%.3f/%.3f"):format(
                     tostring(lead), tostring(t.clockOffset),
-                    nTop, maxTop, nClimb, maxClimb))
+                    nTop, maxTop, nClimb, maxClimb, late, budget))
+                if late > budget + 0.0005 then
+                    warnLog(("release is %.0f ms late - pulling it back"):format(late * 1000))
+                end
                 local b = tonumber(CFG.bias) or 0
                 if b ~= 0 then
                     log(("bias %+.3f - negative = earlier, positive = later"):format(b))
                 end
                 local co = type(t.clockOffset) == "number" and t.clockOffset or 0
-                local ce, cl = CFG.clockEarly or 0.30, CFG.clockLate or 0.12
+                local ce, cl = CFG.clockEarly or 0.20, CFG.clockLate or 0.02
                 if co > 0 and co >= cl - 0.002 then
                     log("clock at LATE cap - bias = -0.05")
                 elseif co < 0 and co <= -ce + 0.002 then
                     log("clock at EARLY cap - bias = 0.05")
                 end
-                if maxClimb > (CFG.climbReset or 0.12) then
+                if maxClimb > (CFG.climbReset or 2.0) then
                     warnLog(("climb stuck at %.2f"):format(maxClimb))
                     warnLog("file not writable? PC: attrib -R")
                 elseif maxClimb > 0 and maxClimb >= (CFG.climbLate or 0.02) - 0.002 then
                     log("climb held at LATE cap - anti-late guard working")
-                elseif minClimb < 0 and -minClimb >= (CFG.climbEarly or 0.06) - 0.002 then
+                elseif minClimb < 0 and -minClimb >= (CFG.climbEarly or 0.04) - 0.002 then
                     log("climb at EARLY cap - bias = 0.05")
                 end
             break
         end
+    end
+end
+
+-- Show what the running game is actually using. This is the proof that the
+-- live copy is pinned and cannot drift late any more.
+local function reportLive()
+    if not liveFound then return end
+    local worstLead, worstClimb, worstTop, n = 0, 0, 0, 0
+    local lateSum = 0
+    pcall(function()
+        for t in pairs(liveStates) do
+            if type(t) == "table" then
+                n = n + 1
+                local h = mapHolder(t) or t
+                if type(h.leads) == "table" then
+                    for _, v in pairs(h.leads) do
+                        if num(v) and v < worstLead then worstLead = v end
+                    end
+                end
+                if type(h.climbs) == "table" then
+                    for _, v in pairs(h.climbs) do
+                        if num(v) and v > worstClimb then worstClimb = v end
+                    end
+                end
+                if type(h.tops) == "table" then
+                    for _, v in pairs(h.tops) do
+                        if num(v) and math.abs(v) > worstTop then worstTop = math.abs(v) end
+                    end
+                end
+                -- what one shot really adds up to
+                lateSum = math.max(lateSum,
+                    mapLateMax(h.leads, true) + mapLateMax(h.climbs, false))
+            end
+        end
+    end)
+    if n == 0 then return end
+    local budget = CFG.lateBudget or 0.04
+    log(("live: %d table(s) lead=%+.3f climb=%+.3f top=%.3f late=%.3f/%.3f"):format(
+        n, worstLead, worstClimb, worstTop, lateSum, budget))
+    if lateSum > budget + 0.0005 then
+        warnLog(("release is %.0f ms late - pulling it back"):format(lateSum * 1000))
     end
 end
 
@@ -768,13 +1276,21 @@ if writeName then
             end
             local before = lateDrift
             local out = cleanData(p, data, true)
+            if out and isAuto(base(p)) then
+                -- the save IS a snapshot of the live table. Keep it as a
+                -- fallback baseline for when the file itself was not found
+                -- (mobile). The file baseline always wins, it is older and
+                -- therefore closer to the good learned values.
+                local now = nowSec()
+                if (not cleanSaveAt) or (now - cleanSaveAt) > 1 then
+                    cleanSaveAt = now
+                    local ct = dec(out)
+                    if ct and looksAuto(ct) then cleanSave = ct end
+                end
+            end
             if out and lateDrift > before and not driftWarned then
                 driftWarned = true
-                if tostring(CFG.reloadCode or "") ~= "" then
-                    warnLog("timing drifting LATE - auto re-anchor armed")
-                else
-                    warnLog("timing drifting LATE - tap FIX TIMING")
-                end
+                warnLog("timing drifting LATE - pulling it back now")
             end
             return call(path, out or data, ...)
         end
@@ -829,46 +1345,10 @@ local function selfTest()
 end
 
 --=====================================================================
--- re-run SynthHub (clears the timing held INSIDE its memory)
---=====================================================================
-local function reloadSynthHub(quiet)
-    local code = tostring(CFG.reloadCode or "")
-    if code == "" then
-        if not quiet then log("files cleaned - now RE-EXECUTE SynthHub") end
-        return false
-    end
-    local f = loadstring or load
-    if not f then
-        warnLog("loadstring blocked - re-execute SynthHub by hand")
-        return false
-    end
-    local fok, chunk, err = pcall(f, code)
-    if not fok then
-        warnLog("loader failed: " .. tostring(chunk))
-        return false
-    end
-    if not chunk then
-        warnLog("reloadCode error: " .. tostring(err))
-        return false
-    end
-    local ok, rerr = pcall(chunk)
-    if not ok then
-        warnLog("reload failed: " .. tostring(rerr))
-        return false
-    end
-    lateDrift = 0
-    driftWarned = false
-    lastReload = nowSec()
-    log("SynthHub reloaded - timing reset")
-    return true
-end
-
---=====================================================================
 -- one-tap FIX TIMING button (mobile friendly)
--- Cleans every file, then re-runs SynthHub if reloadCode is filled in.
--- This is the only way to reset the timing held INSIDE SynthHub's memory.
+-- Cleans every file and pulls the live table back to the clean values.
 --=====================================================================
-local function makeReloadButton()
+local function makeButtons()
     if CFG.onScreen == false or CFG.button == false then return end
     local ok = pcall(function()
         local parent = getGuiParent()
@@ -933,6 +1413,8 @@ local function makeReloadButton()
             local wf = rawIO.rawWrite or rawIO.writefile or writefile
             if wf then pcall(wf, BIAS_FILE, string.format("%.4f", b)) end
             for p in pairs(paths) do cleanFile(p, true, true) end
+            -- the live copy has to move too, otherwise the button does nothing
+            clampLive()
             local word = b < 0 and "earlier" or "later"
             log(("bias %+.3f - releasing %s"):format(b, word))
         end
@@ -951,9 +1433,7 @@ local function makeReloadButton()
             end
             log(("FIX TIMING: %d file(s) cleaned"):format(n))
             driftWarned = false
-            if not reloadSynthHub(false) then
-                log("now RE-EXECUTE SynthHub to clear its memory")
-            end
+            if CFG.liveClamp ~= false then clampLive() end
             task.wait(1.2)
             btn.Text = "FIX TIMING"
             busy = false
@@ -1010,44 +1490,93 @@ if readfile and writefile then
             log("executor blocks hooks - using file watchdog")
         end
     end
-    if tostring(CFG.reloadCode or "") == "" then
-        log("8-minute decay fix: paste SynthHub's loader into reloadCode")
+    if CFG.liveClamp ~= false then
+        log("live timing pinned - no late drift in memory")
     end
 else
     warnLog("executor has no readfile/writefile - file fix disabled")
 end
 
-lastReload = nowSec()
+if CFG.liveClamp ~= false then
+    scanLive(9000, 6, true)
+    clampLive()
+end
 
-if CFG.button ~= false then makeReloadButton() end
+if CFG.button ~= false then makeButtons() end
 
-if CFG.watchdog and readfile and writefile then
+-- Every watchdog pass is protected. If anything inside it throws, the loop
+-- keeps going instead of dying: a dead pin is exactly what makes the timing
+-- drift late again after a few minutes.
+local loopErrs = {}
+local function runLoop(name, every, fn)
     task.spawn(function()
-        local tick = 0
-        -- with reads AND writes blocked the file cannot drift between passes,
-        -- so the sweep can be slower and stay free on FPS
-        local eff = CFG.interval
-        if CFG.blockWrites and readOK then eff = math.max(eff, 1.0) end
         while true do
-            for p in pairs(paths) do cleanFile(p, true) end
-            tick = tick + 1
-            if tick % math.max(20, math.floor(120 / math.max(eff, 0.05))) == 0 then
-                for p in pairs(discover()) do paths[p] = true end
+            local ok, err = pcall(fn)
+            if not ok then
+                loopErrs[name] = (loopErrs[name] or 0) + 1
+                if loopErrs[name] <= 2 then
+                    warnLog(name .. " pass failed, retrying: " .. tostring(err))
+                end
+            else
+                loopErrs[name] = 0
             end
-            local hasLoader = tostring(CFG.reloadCode or "") ~= ""
-            local now = nowSec()
-            local dueDrift = CFG.autoReload and lateDrift > 0
-                and (now - lastReload) > (CFG.reloadCooldown or 120)
-            local every = tonumber(CFG.reloadEvery) or 0
-            local dueTimer = every > 0 and (now - lastReload) > every
-            if hasLoader and (dueDrift or dueTimer) then
-                lastReload = now
-                lateDrift = 0
-                reloadSynthHub(true)
-            end
-            task.wait(eff)
+            task.wait(every)
         end
     end)
 end
 
-log("DONE - tap FIX TIMING or RE-EXECUTE SynthHub")
+-- with reads AND writes blocked the file cannot drift between passes,
+-- so the sweep can be slower and stay free on FPS
+local eff = CFG.interval
+if CFG.blockWrites and readOK then eff = math.max(eff, 1.0) end
+
+-- The file side runs on its own, so a broken file can never stop the pin
+-- that holds the timing in memory.
+if CFG.watchdog and readfile and writefile then
+    local fileTick = 0
+    runLoop("file watchdog", eff, function()
+        for p in pairs(paths) do cleanFile(p, true) end
+        fileTick = fileTick + 1
+        if fileTick % math.max(20, math.floor(120 / math.max(eff, 0.05))) == 0 then
+            for p in pairs(discover()) do paths[p] = true end
+        end
+    end)
+end
+
+-- The pin runs on its own too, and it runs twice as often, so a value that
+-- drifts late is pulled back before the next shot can use it.
+if CFG.watchdog and CFG.liveClamp ~= false then
+    local liveTick = 0
+    local nextCheap, nextFull, nextReport = 0, 0, 0
+    runLoop("live pin", math.min(eff, 0.25), function()
+        liveTick = liveTick + 1
+        clampLive()
+        local now = nowSec()
+        -- cheap tree walk every 5 s
+        if now >= nextCheap then
+            nextCheap = now + 5
+            scanLive(2500, 4, false)
+        end
+        -- The full GC walk is the expensive one. While we are still LOOKING
+        -- for the table it runs often, so the pin starts fast. Once it is
+        -- found the table is held in liveStates and the scan has nothing
+        -- left to do, so it drops back to a rare safety net. That keeps the
+        -- cost off the FPS while shooting.
+        local fullEvery = liveFound and 120 or 15
+        if now >= nextFull then
+            nextFull = now + fullEvery
+            scanLive(6000, 6, true)
+        end
+        -- after 15 s nothing was found: the executor is hiding it
+        if liveTick == 60 and not liveFound and not liveMissed then
+            liveMissed = true
+            warnLog("in-memory timing not found - only the file is being fixed")
+        end
+        if now >= nextReport then
+            nextReport = now + 30
+            reportLive()
+        end
+    end)
+end
+
+log("DONE - timing is pinned in memory and on disk")
