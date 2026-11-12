@@ -2,6 +2,7 @@ local CFG = {
     watchdog      = true,   -- keep re-cleaning while the game is open
     interval      = 0.2,    -- seconds between watchdog passes
     blockWrites   = true,   -- SynthHub itself may NOT edit these files
+    sanitizeReads = true,   -- SynthHub may not READ drifted values either
     verbose       = true,   -- print what it does
     resetTops     = false,  -- keep small learned tops (bounded by topBand)
     resetContest  = false,  -- keep small contest steps (bounded by contestBand)
@@ -11,8 +12,8 @@ local CFG = {
     onScreen      = true,   -- show notifications on the Roblox screen
     button        = true,   -- show the one-tap FIX TIMING button
     console       = false,  -- also print to the executor console
-    duration      = 8,      -- seconds before a notification fades
-    maxMessages   = 6,      -- max notifications on screen at once
+    duration      = 3.5,    -- seconds before a notification fades (tap to dismiss)
+    maxMessages   = 4,      -- max notifications on screen at once
     showPaths     = true,   -- show which files were found + their values
     -- two-stage filter: absurd value -> 0 once, plausible value -> clamped.
     -- Each value has an EARLY limit and a LATE limit, because only lateness is bad.
@@ -72,6 +73,48 @@ local listfiles, listName  = resolve("listfiles", "list_files", "listFiles")
 local delfile              = resolve("delfile", "delete_file", "remove_file")
 local HS        = game:GetService("HttpService")
 local rawIO: {[string]: any} = { readfile = readfile, writefile = writefile }
+
+-- Remember SynthHub's loader so FIX TIMING can re-run it without the user
+-- pasting anything into reloadCode. Only a real script (big enough) counts.
+local capturedReload = ""
+do
+    local loadName = getfn("loadstring") and "loadstring" or (getfn("load") and "load" or nil)
+    local capOrig = loadName and getfn(loadName) or nil
+    if capOrig then
+        local function remember(a, b)
+            local src = a
+            if type(b) == "string" then src = b end
+            if type(src) == "string" and #src >= 800
+                and not src:find("AutoTimeFix", 1, true)
+                and not src:find("autotime_fix", 1, true)
+                and not src:find("autotime_probe", 1, true) then
+                if #src > #capturedReload then capturedReload = src end
+            end
+        end
+        local hooker = getfn("hookfunction") or getfn("replaceclosure")
+            or getfn("hookfunc") or getfn("detourfunction")
+        local done = false
+        if hooker then
+            done = pcall(function()
+                local ret = hooker(capOrig, function(a, b, c)
+                    remember(a, b)
+                    return capOrig(a, b, c)
+                end)
+                if type(ret) ~= "function" then error("no hook") end
+            end)
+        end
+        if not done then
+            -- no hookfunction on this build: wrap the global instead
+            pcall(function()
+                local wrapped = function(a, b, c)
+                    remember(a, b)
+                    return capOrig(a, b, c)
+                end
+                if rawset(genv, loadName, wrapped) then rawIO.rawLoad = capOrig end
+            end)
+        end
+    end
+end
 
 --=====================================================================
 -- on-screen notifications (no console spam)
@@ -134,6 +177,24 @@ local function ensureNotifyGui()
     return ok and notifyGui ~= nil
 end
 
+local function fadeOut(label)
+    if not label or not label.Parent or label:GetAttribute("Dying") then return end
+    label:SetAttribute("Dying", true)
+    local idx = table.find(activeNotes, label)
+    if idx then table.remove(activeNotes, idx) end
+    local ok, ts = pcall(function() return game:GetService("TweenService") end)
+    if ok and ts then
+        local info = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        local tween = ts:Create(label, info, {
+            TextTransparency = 1,
+            BackgroundTransparency = 1,
+        })
+        tween:Play()
+        tween.Completed:Wait()
+    end
+    if label and label.Parent then label:Destroy() end
+end
+
 local function showNote(text, isError)
     if not ensureNotifyGui() then
         print("[AutoTimeFix]", text)
@@ -175,20 +236,16 @@ local function showNote(text, isError)
         if old and old.Parent then old:Destroy() end
     end
 
-    task.delay(CFG.duration or 4, function()
-        if not label or not label.Parent then return end
-        local ok, ts = pcall(function() return game:GetService("TweenService") end)
-        if ok and ts then
-            local info = TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-            local tween = ts:Create(label, info, {
-                TextTransparency = 1,
-                BackgroundTransparency = 1,
-            })
-            tween:Play()
-            tween.Completed:Wait()
+    -- tap / click a message to dismiss it right away
+    label.Active = true
+    label.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            fadeOut(label)
         end
-        if label and label.Parent then label:Destroy() end
     end)
+
+    task.delay(CFG.duration or 3.5, function() fadeOut(label) end)
 end
 
 local function flatten(...)
@@ -392,7 +449,7 @@ local function cleanContest(t)
     return t, changed
 end
 
-local function cleanData(path, data, runtime)
+local function cleanData(path, data, runtime, force)
     if type(data) ~= "string" or #data == 0 then return nil end
     local n = base(path)
     local auto, contest = isAuto(n), isContest(n)
@@ -406,7 +463,7 @@ local function cleanData(path, data, runtime)
     local changed
     if auto then _, changed = cleanAuto(t, runtime)
     else _, changed = cleanContest(t) end
-    if not changed then return nil end
+    if not changed and not force then return nil end
     return enc(t)
 end
 
@@ -495,7 +552,7 @@ local function discover()
 
     -- filename didn't match? identify it by content instead
     if CFG.sniff and readfile then
-        local rf = rawIO.readfile or readfile
+        local rf = rawIO.rawRead or rawIO.readfile or readfile
         for _, p in ipairs(cands) do
             local key = tostring(p):gsub("\\", "/")
             if not found[key] and not key:find("backup", 1, true)
@@ -515,7 +572,7 @@ end
 local warned = {}
 local verified = {}
 local function cleanFile(path, runtime)
-    local rf = rawIO.readfile or readfile
+    local rf = rawIO.rawRead or rawIO.readfile or readfile
     local wf = rawIO.rawWrite or rawIO.writefile or writefile
     if not rf or not wf then return false end
     local ok, data = pcall(rf, path)
@@ -548,8 +605,9 @@ end
 local function installHook(name, key, factory)
     local orig = getfn(name)
     if not orig then return false end
-    -- keep the untouched function so our own writes can bypass the hook
+    -- keep the untouched function so our own reads/writes bypass the hooks
     if key == "writefile" then rawIO.rawWrite = orig end
+    if key == "readfile" then rawIO.rawRead = orig end
     if key == "appendfile" then rawIO.rawAppend = orig end
     local callOrig, active = orig, {}
     local function call(...)
@@ -607,7 +665,7 @@ local function reportPaths()
 end
 
 local function reportValues()
-    local rf = rawIO.readfile or readfile
+    local rf = rawIO.rawRead or rawIO.readfile or readfile
     if not rf then return end
     for p in pairs(paths) do
         local ok, data = pcall(rf, p)
@@ -659,6 +717,9 @@ end
 local hookOK = false
 local dirtyWrites = {}
 local blockedCount = 0
+local blockedWarned = false
+local driftWarned = false
+local lastDriftCheck = 0
 if writeName then
     local function isProtected(p)
         local n = base(tostring(p))
@@ -668,11 +729,61 @@ if writeName then
         return function(path, data, ...)
             local p = tostring(path)
             if CFG.blockWrites and isProtected(p) then
-                blockedCount = (blockedCount or 0) + 1
-                return
+                blockedCount = blockedCount + 1
+                if not blockedWarned then
+                    blockedWarned = true
+                    log("SynthHub save blocked - files stay clean")
+                end
+                -- the blocked save is the only view we get of SynthHub's
+                -- in-memory values, so peek at it (2s max) to spot real drift
+                local now = os.clock()
+                if now - lastDriftCheck > 2 then
+                    lastDriftCheck = now
+                    local t = dec(data)
+                    if t then
+                        local before = lateDrift
+                        if isContest(base(p)) then cleanContest(t) else cleanAuto(t, true) end
+                        if lateDrift > before and not driftWarned then
+                            driftWarned = true
+                            warnLog("SynthHub drifting LATE - tap FIX TIMING")
+                        end
+                    end
+                end
+                return true
             end
             local out = cleanData(p, data, true)
             return call(path, out or data, ...)
+        end
+    end)
+end
+
+-- Reads must be sanitized too. SynthHub re-reads autotime.json while it plays
+-- and folds those numbers back into its memory, so a drifted file would keep
+-- teaching it to be late even with writes blocked.
+local readOK = false
+local lastReadFix = {}
+local readCache = {}
+if readName and CFG.sanitizeReads ~= false then
+    readOK = installHook(readName, "readfile", function(call)
+        return function(path, ...)
+            local data = call(path, ...)
+            if type(data) ~= "string" or #data == 0 then return data end
+            local p = tostring(path)
+            local c = readCache[p]
+            if c and c.raw == data then return c.out end
+            local n = base(p)
+            if not (isAuto(n) or isContest(n)) then return data end
+            local out = cleanData(p, data, false) or data
+            readCache[p] = { raw = data, out = out }
+            if out == data then return data end
+            -- keep the copy on disk clean as well, but never more than once a second
+            local now = os.clock()
+            if (not lastReadFix[p]) or (now - lastReadFix[p]) > 1 then
+                lastReadFix[p] = now
+                local wf = rawIO.rawWrite
+                if wf then pcall(wf, path, out) end
+            end
+            return out
         end
     end)
 end
@@ -684,7 +795,7 @@ local function selfTest()
         if type(f) ~= "function" then f = rawget(_G, n) end
         return f
     end
-    local rf = globalFn(readName) or rawIO.readfile or readfile
+    local rf = rawIO.rawRead or globalFn(readName) or rawIO.readfile or readfile
     local wf = rawIO.rawWrite or globalFn(writeName) or rawIO.writefile or writefile
     if not rf or not wf then return false end
     local probe = "autotime_probe.json"
@@ -709,11 +820,14 @@ end
 --=====================================================================
 local function reloadSynthHub(quiet)
     local code = tostring(CFG.reloadCode or "")
+    if code == "" and capturedReload and #capturedReload >= 800 then
+        code = capturedReload
+    end
     if code == "" then
         if not quiet then log("files cleaned - now RE-EXECUTE SynthHub") end
         return false
     end
-    local f = loadstring or load
+    local f = rawIO.rawLoad or loadstring or load
     if not f then
         warnLog("loadstring blocked - re-execute SynthHub by hand")
         return false
@@ -729,6 +843,7 @@ local function reloadSynthHub(quiet)
         return false
     end
     lateDrift = 0
+    driftWarned = false
     lastReload = os.clock()
     log("SynthHub reloaded - timing reset")
     return true
@@ -784,7 +899,10 @@ local function makeReloadButton()
                 if cleanFile(p, true) then n = n + 1 end
             end
             log(("FIX TIMING: %d file(s) cleaned"):format(n))
-            reloadSynthHub(false)
+            driftWarned = false
+            if not reloadSynthHub(false) then
+                log("now RE-EXECUTE SynthHub to clear its memory")
+            end
             task.wait(1.2)
             btn.Text = "FIX TIMING"
             busy = false
@@ -820,6 +938,13 @@ if readfile and writefile then
     elseif not hookOK then
         log("no write hook - using file watchdog only")
     end
+    if CFG.blockWrites then
+        if readOK then
+            log("reads + saves blocked - SynthHub cannot drift")
+        else
+            warnLog("saves blocked, reads NOT - drift may continue")
+        end
+    end
 else
     warnLog("executor has no readfile/writefile - file fix disabled")
 end
@@ -831,18 +956,23 @@ if CFG.button ~= false then makeReloadButton() end
 if CFG.watchdog and readfile and writefile then
     task.spawn(function()
         local tick = 0
+        -- with reads AND writes blocked the file cannot drift between passes,
+        -- so the sweep can be slower and stay free on FPS
+        local eff = CFG.interval
+        if CFG.blockWrites and readOK then eff = math.max(eff, 1.0) end
         while true do
             for p in pairs(paths) do cleanFile(p, true) end
             tick = tick + 1
-            if tick % 25 == 0 then
+            if tick % math.max(5, math.floor(25 / math.max(eff, 0.05))) == 0 then
                 for p in pairs(discover()) do paths[p] = true end
             end
             if CFG.autoReload and lateDrift > 0
                 and (os.clock() - lastReload) > (CFG.reloadCooldown or 300) then
                 lastReload = os.clock()
-                reloadSynthHub(false)
+                lateDrift = 0
+                reloadSynthHub(true)
             end
-            task.wait(CFG.interval)
+            task.wait(eff)
         end
     end)
 end
