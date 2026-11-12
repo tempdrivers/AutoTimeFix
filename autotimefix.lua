@@ -1,7 +1,7 @@
 local CFG = {
     watchdog      = true,   -- keep re-cleaning while the game is open
-    interval      = 0.2,    -- seconds between watchdog passes
-    blockWrites   = true,   -- SynthHub itself may NOT edit these files
+    interval      = 0.5,    -- seconds between watchdog passes
+    blockWrites   = false,  -- let SynthHub save, but every save is CLAMPED
     sanitizeReads = true,   -- SynthHub may not READ drifted values either
     verbose       = true,   -- print what it does
     resetTops     = false,  -- keep small learned tops (bounded by topBand)
@@ -15,23 +15,25 @@ local CFG = {
     duration      = 3.5,    -- seconds before a notification fades (tap to dismiss)
     maxMessages   = 4,      -- max notifications on screen at once
     showPaths     = true,   -- show which files were found + their values
-    -- two-stage filter: absurd value -> 0 once, plausible value -> clamped.
-    -- Each value has an EARLY limit and a LATE limit, because only lateness is bad.
-    clockReset    = 0.8,    -- clockOffset above this is garbage -> 0 once
+    -- Every value is CLAMPED continuously. Nothing is ever snapped back to 0
+    -- inside the normal range, because that jump is what makes the greens
+    -- alternate between "too early" and "too late" after a few minutes.
+    clockReset    = 3.0,    -- only insane values are zeroed (never in normal play)
     clockEarly    = 0.30,   -- how far the clock may go toward EARLY
-    clockLate     = 0.12,   -- how far the clock may go toward LATE (positive = late)
-    climbReset    = 0.12,   -- per-shot value above this is garbage -> 0 once
+    clockLate     = 0.14,   -- how far the clock may go toward LATE (positive = late)
+    climbReset    = 2.0,    -- only insane values are zeroed (never in normal play)
     climbEarly    = 0.06,   -- how far a climb may go toward EARLY
-    climbLate     = 0.02,   -- how far a climb may go toward LATE (positive = late)
-    topReset      = 0.12,
+    climbLate     = 0.04,   -- how far a climb may go toward LATE (positive = late)
+    topReset      = 2.0,
     topBand       = 0.04,   -- tops are kept symmetric, direction not proven
-    leadReset     = 0.08,
+    leadReset     = 2.0,
     leadEarly     = 0.06,   -- lead positive = EARLY
-    leadLate      = 0.05,   -- lead negative = LATE (magnitude)
+    leadLate      = 0.055,  -- lead negative = LATE (magnitude)
     contestBand   = 0.5,
     bias          = 0,      -- shifts both limits: -0.05 = earlier, 0.05 = later
     autoReload    = true,   -- reload SynthHub if late drift is detected
-    reloadCooldown= 300,    -- seconds between automatic reloads
+    reloadCooldown= 120,    -- min seconds between drift-triggered reloads
+    reloadEvery   = 300,    -- also re-run SynthHub every N s (0 = off). Needs reloadCode.
     reloadCode    = "",     -- paste SynthHub's loadstring here -> FIX TIMING button
     leadOverride  = nil,    -- force leads hard. nil = auto band check
     clockOverride = nil,    -- force clockOffset hard. nil = auto band check
@@ -78,6 +80,20 @@ local rawIO: {[string]: any} = { readfile = readfile, writefile = writefile }
 -- `loadstring(game:HttpGet(...))()` at line 1, and hooking it there causes
 -- "C stack overflow" in loadstring. FIX TIMING re-runs SynthHub only from the
 -- code you paste into `reloadCode`.
+
+-- The EARLIER / LATER buttons save their setting here so it survives a
+-- re-execute. A plain number, no JSON.
+local BIAS_FILE = "autotime_fix_bias.txt"
+do
+    if (tonumber(CFG.bias) or 0) == 0 then
+        local rf = rawIO.rawRead or readfile
+        if rf then
+            local ok, s = pcall(rf, BIAS_FILE)
+            local v = ok and type(s) == "string" and tonumber(s:match("^%s*(-?%d+%.?%d*)")) or nil
+            if v then CFG.bias = math.max(-0.12, math.min(0.12, v)) end
+        end
+    end
+end
 
 --=====================================================================
 -- on-screen notifications (no console spam)
@@ -275,10 +291,15 @@ end
 -- passes can never accumulate into a runaway offset (that caused the bounce).
 local function clampBand(v, early, late, lateIsNegative, bias)
     if not num(v) then return 0 end
-    local lo, hi
-    if lateIsNegative then lo, hi = -late, early else lo, hi = -early, late end
     local b = num(bias) and bias or 0
-    if b ~= 0 then lo, hi = lo + b, hi + b end
+    local lo, hi
+    if lateIsNegative then
+        -- leads are negative when late, so +bias (later) must move BOTH
+        -- limits down, not up, or LATER would make leads go early.
+        lo, hi = -late - b, early - b
+    else
+        lo, hi = -early + b, late + b
+    end
     if lo > hi then lo = hi end
     if v < lo then return lo elseif v > hi then return hi end
     return v
@@ -286,6 +307,14 @@ end
 local function jobId()
     local ok, j = pcall(function() return game.JobId end)
     return ok and type(j) == "string" and j or ""
+end
+
+-- wall-clock seconds. os.time() keeps counting while the game is idle, unlike
+-- a CPU-time clock, which would make the automatic reload never fire.
+local function nowSec()
+    local t = os.time()
+    if type(t) == "number" and t > 0 then return t end
+    return os.clock()
 end
 
 
@@ -331,7 +360,7 @@ local function cleanAuto(t, runtime)
         if job ~= "" and (t.clockServer == nil or t.clockServer == "") then
             t.clockServer = job; changed = true
         end
-        if num(t.clockOffset) and t.clockOffset > cl + 0.02 then
+        if num(t.clockOffset) and t.clockOffset > cl + 0.10 then
             lateDrift = lateDrift + 1
         end
         local nv = fixClock(t.clockOffset)
@@ -349,7 +378,7 @@ local function cleanAuto(t, runtime)
             local ce2, cl2 = CFG.climbEarly or 0.06, CFG.climbLate or 0.02
             local cr = CFG.climbReset or 0.12
             for k, v in pairs(t.climbs) do
-                if num(v) and v > cl2 + 0.01 then lateDrift = lateDrift + 1 end
+                if num(v) and v > cl2 + 0.08 then lateDrift = lateDrift + 1 end
                 local nv
                 if not num(v) or math.abs(v) > cr then nv = 0
                 else nv = clampBand(v, ce2, cl2, false, CFG.bias) end
@@ -366,6 +395,7 @@ local function cleanAuto(t, runtime)
         for k, v in pairs(t.leads) do
             local le, ll = CFG.leadEarly or 0.06, CFG.leadLate or 0.05
             local lr = CFG.leadReset or 0.08
+            if num(v) and v < -(ll + 0.06) then lateDrift = lateDrift + 1 end
             local nv
             if CFG.leadOverride ~= nil then nv = CFG.leadOverride
             elseif CFG.wipeLearned then nv = 0
@@ -416,10 +446,14 @@ local function cleanData(path, data, runtime, force)
     if type(data) ~= "string" or #data == 0 then return nil end
     local n = base(path)
     local auto, contest = isAuto(n), isContest(n)
+    if not auto and not contest then
+        if not CFG.sniff then return nil end
+        -- never parse huge or non-JSON payloads (Lua source, caches, logs)
+        if data:byte(1) ~= 123 or #data > 262144 then return nil end
+    end
     local t = dec(data)
     if not t then return nil end
     if not auto and not contest then
-        if not CFG.sniff then return nil end
         auto, contest = looksAuto(t), looksContest(t)
         if not auto and not contest then return nil end
     end
@@ -534,13 +568,14 @@ end
 
 local warned = {}
 local verified = {}
-local function cleanFile(path, runtime)
+local lastCleanLog = {}
+local function cleanFile(path, runtime, force)
     local rf = rawIO.rawRead or rawIO.readfile or readfile
     local wf = rawIO.rawWrite or rawIO.writefile or writefile
     if not rf or not wf then return false end
     local ok, data = pcall(rf, path)
     if not ok or type(data) ~= "string" then return false end
-    local out = cleanData(path, data, runtime)
+    local out = cleanData(path, data, runtime, force)
     if not out then return false end
     local wok, err = pcall(wf, path, out)
     if not wok then
@@ -553,7 +588,13 @@ local function cleanFile(path, runtime)
         return false
     end
     warned[path] = nil
-    log("cleaned " .. path)
+    -- never spam the screen: a drifting file can be rewritten on almost every
+    -- shot, so show this at most once per 30 s per file
+    local now = nowSec()
+    if (not lastCleanLog[path]) or (now - lastCleanLog[path]) > 30 then
+        lastCleanLog[path] = now
+        log("cleaned " .. path)
+    end
     if not verified[path] then
         verified[path] = true
         local vok, vdata = pcall(rf, path)
@@ -568,10 +609,6 @@ end
 local function installHook(name, key, factory)
     local orig = getfn(name)
     if not orig then return false end
-    -- keep the untouched function so our own reads/writes bypass the hooks
-    if key == "writefile" then rawIO.rawWrite = orig end
-    if key == "readfile" then rawIO.rawRead = orig end
-    if key == "appendfile" then rawIO.rawAppend = orig end
     local callOrig, active = orig, {}
     local function call(...)
         local co = coroutine.running() or "main"
@@ -592,6 +629,12 @@ local function installHook(name, key, factory)
             if ok and type(ret) == "function" then
                 callOrig = ret
                 rawIO[key] = ret
+                -- Keep the REAL original for our own reads/writes. Some
+                -- executors patch the passed function in place, so storing it
+                -- would re-enter the wrapper (the old loadstring crash).
+                if key == "writefile" then rawIO.rawWrite = ret end
+                if key == "readfile" then rawIO.rawRead = ret end
+                if key == "appendfile" then rawIO.rawAppend = ret end
                 rawIO.mode = hn
                 log(key .. " hooked via " .. hn)
                 return true
@@ -606,6 +649,10 @@ local function installHook(name, key, factory)
     end
     if assign(genv) or assign(_G) then
         rawIO[key] = wrapper
+        -- the global now points at the wrapper, but the original object was
+        -- NOT patched, so we can still call it directly
+        if key == "writefile" then rawIO.rawWrite = orig end
+        if key == "readfile" then rawIO.rawRead = orig end
         rawIO.mode = "wrapped"
         log(key .. " wrapped (no hookfunction)")
         return true
@@ -659,6 +706,10 @@ local function reportValues()
                 log(("values: lead=%s clock=%s tops=%d/%.2f climb=%d/%.2f"):format(
                     tostring(lead), tostring(t.clockOffset),
                     nTop, maxTop, nClimb, maxClimb))
+                local b = tonumber(CFG.bias) or 0
+                if b ~= 0 then
+                    log(("bias %+.3f - negative = earlier, positive = later"):format(b))
+                end
                 local co = type(t.clockOffset) == "number" and t.clockOffset or 0
                 local ce, cl = CFG.clockEarly or 0.30, CFG.clockLate or 0.12
                 if co > 0 and co >= cl - 0.002 then
@@ -700,7 +751,7 @@ if writeName then
                 end
                 -- the blocked save is the only view we get of SynthHub's
                 -- in-memory values, so peek at it (2s max) to spot real drift
-                local now = os.clock()
+                local now = nowSec()
                 if now - lastDriftCheck > 2 then
                     lastDriftCheck = now
                     local t = dec(data)
@@ -715,7 +766,16 @@ if writeName then
                 end
                 return true
             end
+            local before = lateDrift
             local out = cleanData(p, data, true)
+            if out and lateDrift > before and not driftWarned then
+                driftWarned = true
+                if tostring(CFG.reloadCode or "") ~= "" then
+                    warnLog("timing drifting LATE - auto re-anchor armed")
+                else
+                    warnLog("timing drifting LATE - tap FIX TIMING")
+                end
+            end
             return call(path, out or data, ...)
         end
     end)
@@ -741,7 +801,7 @@ if readName and CFG.sanitizeReads ~= false then
             readCache[p] = { raw = data, out = out }
             if out == data then return data end
             -- keep the copy on disk clean as well, but never more than once a second
-            local now = os.clock()
+            local now = nowSec()
             if (not lastReadFix[p]) or (now - lastReadFix[p]) > 1 then
                 lastReadFix[p] = now
                 local wf = rawIO.rawWrite
@@ -798,7 +858,7 @@ local function reloadSynthHub(quiet)
     end
     lateDrift = 0
     driftWarned = false
-    lastReload = os.clock()
+    lastReload = nowSec()
     log("SynthHub reloaded - timing reset")
     return true
 end
@@ -824,24 +884,61 @@ local function makeReloadButton()
         gui.DisplayOrder = 2147483646
         gui.Parent = parent
 
-        local btn = Instance.new("TextButton")
-        btn.Name = "Fix"
-        btn.AnchorPoint = Vector2.new(1, 1)
-        btn.Position = UDim2.new(1, -14, 1, -14)
-        btn.Size = UDim2.new(0, 132, 0, 44)
-        btn.BackgroundColor3 = Color3.fromRGB(18, 20, 22)
-        btn.BackgroundTransparency = 0.1
-        btn.BorderSizePixel = 0
-        btn.AutoButtonColor = true
-        btn.Text = "FIX TIMING"
-        btn.TextColor3 = Color3.fromRGB(120, 255, 150)
-        btn.TextSize = 17
-        btn.Font = Enum.Font.GothamBold
-        btn.Parent = gui
+        local bar = Instance.new("Frame")
+        bar.Name = "Bar"
+        bar.AnchorPoint = Vector2.new(1, 1)
+        bar.Position = UDim2.new(1, -14, 1, -14)
+        bar.Size = UDim2.new(0, 336, 0, 44)
+        bar.BackgroundTransparency = 1
+        bar.Parent = gui
 
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 8)
-        corner.Parent = btn
+        local layout = Instance.new("UIListLayout")
+        layout.FillDirection = Enum.FillDirection.Horizontal
+        layout.Padding = UDim.new(0, 6)
+        layout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+        layout.VerticalAlignment = Enum.VerticalAlignment.Center
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = bar
+
+        local function makeBtn(text, w, color, order)
+            local b = Instance.new("TextButton")
+            b.Size = UDim2.new(0, w, 0, 44)
+            b.BackgroundColor3 = Color3.fromRGB(18, 20, 22)
+            b.BackgroundTransparency = 0.1
+            b.BorderSizePixel = 0
+            b.AutoButtonColor = true
+            b.Text = text
+            b.TextColor3 = color
+            b.TextSize = 15
+            b.Font = Enum.Font.GothamBold
+            b.LayoutOrder = order
+            b.Parent = bar
+            local c = Instance.new("UICorner")
+            c.CornerRadius = UDim.new(0, 8)
+            c.Parent = b
+            return b
+        end
+
+        local earlier = makeBtn("EARLIER", 84, Color3.fromRGB(120, 200, 255), 1)
+        local later   = makeBtn("LATER",   84, Color3.fromRGB(255, 210, 120), 2)
+        local btn     = makeBtn("FIX TIMING", 150, Color3.fromRGB(120, 255, 150), 3)
+
+        -- nudge every value a little earlier / later, then rewrite the files.
+        -- bias shifts the allowed window, so pressing it repeatedly cannot
+        -- stack up into a runaway - it just moves the window.
+        local function nudge(delta)
+            local b = tonumber(CFG.bias) or 0
+            b = math.max(-0.12, math.min(0.12, b + delta))
+            CFG.bias = b
+            local wf = rawIO.rawWrite or rawIO.writefile or writefile
+            if wf then pcall(wf, BIAS_FILE, string.format("%.4f", b)) end
+            for p in pairs(paths) do cleanFile(p, true, true) end
+            local word = b < 0 and "earlier" or "later"
+            log(("bias %+.3f - releasing %s"):format(b, word))
+        end
+
+        earlier.MouseButton1Click:Connect(function() nudge(-0.005) end)
+        later.MouseButton1Click:Connect(function() nudge(0.005) end)
 
         local busy = false
         btn.MouseButton1Click:Connect(function()
@@ -850,7 +947,7 @@ local function makeReloadButton()
             btn.Text = "FIXING..."
             local n = 0
             for p in pairs(paths) do
-                if cleanFile(p, true) then n = n + 1 end
+                if cleanFile(p, true, true) then n = n + 1 end
             end
             log(("FIX TIMING: %d file(s) cleaned"):format(n))
             driftWarned = false
@@ -900,12 +997,27 @@ if readfile and writefile then
         else
             log("executor blocks hooks - using file watchdog")
         end
+    else
+        -- default: let SynthHub save, but every save is clamped into the
+        -- allowed window. This keeps its learnt values consistent instead of
+        -- slowly drifting latch-up.
+        if hookOK and rawIO.mode == "wrapped" then
+            log("saves clamped (soft mode)")
+            log("RE-EXECUTE SynthHub once so it uses it")
+        elseif hookOK then
+            log("saves clamped - timing cannot drift past the caps")
+        else
+            log("executor blocks hooks - using file watchdog")
+        end
+    end
+    if tostring(CFG.reloadCode or "") == "" then
+        log("8-minute decay fix: paste SynthHub's loader into reloadCode")
     end
 else
     warnLog("executor has no readfile/writefile - file fix disabled")
 end
 
-lastReload = os.clock()
+lastReload = nowSec()
 
 if CFG.button ~= false then makeReloadButton() end
 
@@ -919,13 +1031,17 @@ if CFG.watchdog and readfile and writefile then
         while true do
             for p in pairs(paths) do cleanFile(p, true) end
             tick = tick + 1
-            if tick % math.max(5, math.floor(25 / math.max(eff, 0.05))) == 0 then
+            if tick % math.max(20, math.floor(120 / math.max(eff, 0.05))) == 0 then
                 for p in pairs(discover()) do paths[p] = true end
             end
-            if CFG.autoReload and lateDrift > 0
-                and tostring(CFG.reloadCode or "") ~= ""
-                and (os.clock() - lastReload) > (CFG.reloadCooldown or 300) then
-                lastReload = os.clock()
+            local hasLoader = tostring(CFG.reloadCode or "") ~= ""
+            local now = nowSec()
+            local dueDrift = CFG.autoReload and lateDrift > 0
+                and (now - lastReload) > (CFG.reloadCooldown or 120)
+            local every = tonumber(CFG.reloadEvery) or 0
+            local dueTimer = every > 0 and (now - lastReload) > every
+            if hasLoader and (dueDrift or dueTimer) then
+                lastReload = now
                 lateDrift = 0
                 reloadSynthHub(true)
             end
