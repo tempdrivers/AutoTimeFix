@@ -1,6 +1,6 @@
 local CFG = {
     watchdog      = true,   -- keep re-cleaning while the game is open
-    interval      = 0.5,    -- seconds between watchdog passes
+    interval      = 0.2,    -- seconds between watchdog passes (fast on mobile)
     verbose       = true,   -- print what it does
     resetTops     = false,  -- keep small learned tops (bounded by topBand)
     resetContest  = false,  -- keep small contest steps (bounded by contestBand)
@@ -8,21 +8,29 @@ local CFG = {
     cleanNow      = true,   -- clean the files immediately
     useJobId      = true,   -- only clear clockOffset for a DIFFERENT server
     onScreen      = true,   -- show notifications on the Roblox screen
+    button        = true,   -- show the one-tap FIX TIMING button
     console       = false,  -- also print to the executor console
     duration      = 8,      -- seconds before a notification fades
     maxMessages   = 6,      -- max notifications on screen at once
     showPaths     = true,   -- show which files were found + their values
-    -- two-stage filter: absurd value -> 0, plausible value -> clamped into band
-    clockReset    = 1.0,    -- clockOffset above this is garbage -> 0
-    clockBand     = 0.5,    -- clockOffset legal range (big = LATE)
-    climbReset    = 0.30,   -- per-shot value above this is garbage -> 0
-    climbBand     = 0.08,   -- per-shot learning range
-    topReset      = 0.30,
-    topBand       = 0.08,
-    leadReset     = 0.10,
-    leadBand      = 0.06,
+    -- two-stage filter: absurd value -> 0 once, plausible value -> clamped.
+    -- Each value has an EARLY limit and a LATE limit, because only lateness is bad.
+    clockReset    = 0.8,    -- clockOffset above this is garbage -> 0 once
+    clockEarly    = 0.30,   -- how far the clock may go toward EARLY
+    clockLate     = 0.12,   -- how far the clock may go toward LATE (positive = late)
+    climbReset    = 0.12,   -- per-shot value above this is garbage -> 0 once
+    climbEarly    = 0.06,   -- how far a climb may go toward EARLY
+    climbLate     = 0.02,   -- how far a climb may go toward LATE (positive = late)
+    topReset      = 0.12,
+    topBand       = 0.04,   -- tops are kept symmetric, direction not proven
+    leadReset     = 0.08,
+    leadEarly     = 0.06,   -- lead positive = EARLY
+    leadLate      = 0.05,   -- lead negative = LATE (magnitude)
     contestBand   = 0.5,
-    bias          = 0,      -- global nudge: POSITIVE = later, NEGATIVE = earlier
+    bias          = 0,      -- shifts both limits: -0.05 = earlier, 0.05 = later
+    autoReload    = true,   -- reload SynthHub if late drift is detected
+    reloadCooldown= 300,    -- seconds between automatic reloads
+    reloadCode    = "",     -- paste SynthHub's loadstring here -> FIX TIMING button
     leadOverride  = nil,    -- force leads hard. nil = auto band check
     clockOverride = nil,    -- force clockOffset hard. nil = auto band check
     topOverride   = nil,    -- force every tops entry hard. nil = 0
@@ -241,11 +249,26 @@ local function clamp(v, lo, hi)
     if v < lo then return lo elseif v > hi then return hi end
     return v
 end
+-- Clamp toward EARLY/LATE limits separately, then optionally shift the whole
+-- window by `bias`. Shifting the window is idempotent, so repeated watchdog
+-- passes can never accumulate into a runaway offset (that caused the bounce).
+local function clampBand(v, early, late, lateIsNegative, bias)
+    if not num(v) then return 0 end
+    local lo, hi
+    if lateIsNegative then lo, hi = -late, early else lo, hi = -early, late end
+    local b = num(bias) and bias or 0
+    if b ~= 0 then lo, hi = lo + b, hi + b end
+    if lo > hi then lo = hi end
+    if v < lo then return lo elseif v > hi then return hi end
+    return v
+end
 local function jobId()
     local ok, j = pcall(function() return game.JobId end)
     return ok and type(j) == "string" and j or ""
 end
 
+
+local lateDrift, lastReload = 0, 0
 
 local function cleanAuto(t, runtime)
     if type(t) ~= "table" then return nil, false end
@@ -256,7 +279,7 @@ local function cleanAuto(t, runtime)
     local changed = false
 
     if type(t.tops) ~= "table" then t.tops = {}; changed = true end
-    local tb, tr = CFG.topBand or 0.08, CFG.topReset or 0.30
+    local tb, tr = CFG.topBand or 0.04, CFG.topReset or 0.12
     for k, v in pairs(t.tops) do
         local nv
         if CFG.topOverride ~= nil then nv = CFG.topOverride
@@ -267,25 +290,30 @@ local function cleanAuto(t, runtime)
     end
 
     local job = CFG.useJobId and jobId() or ""
-    local cband, creset = CFG.clockBand or 0.5, CFG.clockReset or 1.0
+    local ce, cl = CFG.clockEarly or 0.30, CFG.clockLate or 0.12
+    local creset = CFG.clockReset or 0.8
     local function fixClock(v)
         if not num(v) or math.abs(v) > creset then return 0 end
-        return clamp(v, -cband, cband)
+        return clampBand(v, ce, cl, false, CFG.bias)
     end
     if CFG.clockOverride ~= nil then
         if t.clockOffset ~= CFG.clockOverride then
             t.clockOffset = CFG.clockOverride; changed = true
         end
-    elseif job ~= "" and t.clockServer ~= job then
+    elseif job ~= "" and t.clockServer ~= nil and t.clockServer ~= ""
+        and t.clockServer ~= job then
+        -- stored offset was learned on a different server: drop it exactly once
         if t.clockOffset ~= 0 then t.clockOffset = 0; changed = true end
-        if t.clockServer ~= nil and t.clockServer ~= "" then
-            t.clockServer = ""; changed = true
-        end
+        t.clockServer = job; changed = true
     else
-        local nv = fixClock(t.clockOffset)
-        if CFG.bias and CFG.bias ~= 0 then
-            nv = clamp(nv + CFG.bias, -cband, cband)
+        -- remember the server so we never wipe our own learned offset again
+        if job ~= "" and (t.clockServer == nil or t.clockServer == "") then
+            t.clockServer = job; changed = true
         end
+        if num(t.clockOffset) and t.clockOffset > cl + 0.02 then
+            lateDrift = lateDrift + 1
+        end
+        local nv = fixClock(t.clockOffset)
         if t.clockOffset ~= nv then t.clockOffset = nv; changed = true end
     end
     if t.clockServer == nil then t.clockServer = ""; changed = true end
@@ -297,11 +325,13 @@ local function cleanAuto(t, runtime)
                 changed = true
             end
         else
-            local cb, cr = CFG.climbBand or 0.08, CFG.climbReset or 0.30
+            local ce2, cl2 = CFG.climbEarly or 0.06, CFG.climbLate or 0.02
+            local cr = CFG.climbReset or 0.12
             for k, v in pairs(t.climbs) do
+                if num(v) and v > cl2 + 0.01 then lateDrift = lateDrift + 1 end
                 local nv
                 if not num(v) or math.abs(v) > cr then nv = 0
-                else nv = clamp(v, -cb, cb) end
+                else nv = clampBand(v, ce2, cl2, false, CFG.bias) end
                 if v ~= nv then t.climbs[k] = nv; changed = true end
             end
         end
@@ -313,12 +343,13 @@ local function cleanAuto(t, runtime)
     end
     if type(t.leads) == "table" then
         for k, v in pairs(t.leads) do
-            local lb, lr = CFG.leadBand or 0.06, CFG.leadReset or 0.10
+            local le, ll = CFG.leadEarly or 0.06, CFG.leadLate or 0.05
+            local lr = CFG.leadReset or 0.08
             local nv
             if CFG.leadOverride ~= nil then nv = CFG.leadOverride
             elseif CFG.wipeLearned then nv = 0
             elseif not num(v) or math.abs(v) > lr then nv = 0
-            else nv = clamp(v, -lb, lb) end
+            else nv = clampBand(v, le, ll, true, CFG.bias) end
             if v ~= nv then t.leads[k] = nv; changed = true end
         end
     end
@@ -588,12 +619,13 @@ local function reportValues()
                     end
                 end
                 local lead = t.leads and t.leads.jumper
-                local nClimb, maxClimb = 0, 0
+                local nClimb, maxClimb, minClimb = 0, 0, 0
                 if type(t.climbs) == "table" then
                     for _, v in pairs(t.climbs) do
                         if type(v) == "number" then
                             nClimb = nClimb + 1
-                            if math.abs(v) > maxClimb then maxClimb = math.abs(v) end
+                            if v > maxClimb then maxClimb = v end
+                            if v < minClimb then minClimb = v end
                         end
                     end
                 end
@@ -601,18 +633,19 @@ local function reportValues()
                     tostring(lead), tostring(t.clockOffset),
                     nTop, maxTop, nClimb, maxClimb))
                 local co = type(t.clockOffset) == "number" and t.clockOffset or 0
-                local cbd = CFG.clockBand or 0.5
-                if co > 0 and co >= cbd - 0.002 then
-                    log("clock maxed LATE - set bias = -0.05")
-                elseif co < 0 and co <= -cbd + 0.002 then
-                    log("clock maxed EARLY - set bias = 0.05")
+                local ce, cl = CFG.clockEarly or 0.30, CFG.clockLate or 0.12
+                if co > 0 and co >= cl - 0.002 then
+                    log("clock at LATE cap - bias = -0.05")
+                elseif co < 0 and co <= -ce + 0.002 then
+                    log("clock at EARLY cap - bias = 0.05")
                 end
-                if maxClimb > (CFG.climbReset or 0.30) then
+                if maxClimb > (CFG.climbReset or 0.12) then
                     warnLog(("climb stuck at %.2f"):format(maxClimb))
                     warnLog("file not writable? PC: attrib -R")
-                elseif maxClimb > 0 and CFG.climbBand
-                    and maxClimb >= CFG.climbBand - 0.002 then
-                    log("climb at cap - raise climbBand to 0.15")
+                elseif maxClimb > 0 and maxClimb >= (CFG.climbLate or 0.02) - 0.002 then
+                    log("climb held at LATE cap - anti-late guard working")
+                elseif minClimb < 0 and -minClimb >= (CFG.climbEarly or 0.06) - 0.002 then
+                    log("climb at EARLY cap - bias = 0.05")
                 end
             break
         end
@@ -653,6 +686,95 @@ local function selfTest()
     return passed
 end
 
+--=====================================================================
+-- re-run SynthHub (clears the timing held INSIDE its memory)
+--=====================================================================
+local function reloadSynthHub(quiet)
+    local code = tostring(CFG.reloadCode or "")
+    if code == "" then
+        if not quiet then log("files cleaned - now RE-EXECUTE SynthHub") end
+        return false
+    end
+    local f = loadstring or load
+    if not f then
+        warnLog("loadstring blocked - re-execute SynthHub by hand")
+        return false
+    end
+    local chunk, err = f(code)
+    if not chunk then
+        warnLog("reloadCode error: " .. tostring(err))
+        return false
+    end
+    local ok, rerr = pcall(chunk)
+    if not ok then
+        warnLog("reload failed: " .. tostring(rerr))
+        return false
+    end
+    lateDrift = 0
+    lastReload = os.clock()
+    log("SynthHub reloaded - timing reset")
+    return true
+end
+
+--=====================================================================
+-- one-tap FIX TIMING button (mobile friendly)
+-- Cleans every file, then re-runs SynthHub if reloadCode is filled in.
+-- This is the only way to reset the timing held INSIDE SynthHub's memory.
+--=====================================================================
+local function makeReloadButton()
+    if CFG.onScreen == false or CFG.button == false then return end
+    local ok = pcall(function()
+        local parent = getGuiParent()
+        if not parent then return end
+        for _, v in ipairs(parent:GetChildren()) do
+            if v.Name == "AutoTimeFixButton" then v:Destroy() end
+        end
+
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "AutoTimeFixButton"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.DisplayOrder = 2147483646
+        gui.Parent = parent
+
+        local btn = Instance.new("TextButton")
+        btn.Name = "Fix"
+        btn.AnchorPoint = Vector2.new(1, 1)
+        btn.Position = UDim2.new(1, -14, 1, -14)
+        btn.Size = UDim2.new(0, 132, 0, 44)
+        btn.BackgroundColor3 = Color3.fromRGB(18, 20, 22)
+        btn.BackgroundTransparency = 0.1
+        btn.BorderSizePixel = 0
+        btn.AutoButtonColor = true
+        btn.Text = "FIX TIMING"
+        btn.TextColor3 = Color3.fromRGB(120, 255, 150)
+        btn.TextSize = 17
+        btn.Font = Enum.Font.GothamBold
+        btn.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = btn
+
+        local busy = false
+        btn.MouseButton1Click:Connect(function()
+            if busy then return end
+            busy = true
+            btn.Text = "FIXING..."
+            local n = 0
+            for p in pairs(paths) do
+                if cleanFile(p, true) then n = n + 1 end
+            end
+            log(("FIX TIMING: %d file(s) cleaned"):format(n))
+            reloadSynthHub(false)
+            task.wait(1.2)
+            btn.Text = "FIX TIMING"
+            busy = false
+        end)
+    end)
+    return ok
+end
+
 if readfile and writefile then
     if CFG.cleanNow then
         local found, cleaned = 0, 0
@@ -684,13 +806,22 @@ else
     warnLog("executor has no readfile/writefile - file fix disabled")
 end
 
+lastReload = os.clock()
+
+if CFG.button ~= false then makeReloadButton() end
+
 if CFG.watchdog and readfile and writefile then
     task.spawn(function()
         local tick = 0
         while true do
             for p in pairs(paths) do cleanFile(p, true) end
+            if CFG.autoReload and lateDrift > 0
+                and (os.clock() - lastReload) > (CFG.reloadCooldown or 300) then
+                lastReload = os.clock()
+                reloadSynthHub(false)
+            end
             tick = tick + 1
-            if tick % 8 == 0 then
+            if tick % 25 == 0 then
                 for p in pairs(discover()) do paths[p] = true end
             end
             task.wait(CFG.interval)
@@ -698,4 +829,4 @@ if CFG.watchdog and readfile and writefile then
     end)
 end
 
-log("DONE - now RE-EXECUTE SynthHub")
+log("DONE - tap FIX TIMING or RE-EXECUTE SynthHub")
